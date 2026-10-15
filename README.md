@@ -1,5 +1,14 @@
 # Radhe Stock Market Predictor
 
+## Stability hotfix (3.1)
+
+- `frontend/styles.css` is included and served at `/static/styles.css`.
+- `/api/live` returns a structured dashboard response instead of surfacing temporary provider failures as HTTP 503.
+- After market close, the live-state path falls back from WebSocket/current-day intraday data to recent historical candles, so the last real session remains visible.
+- Last-price fallback uses the latest market quote when candle history is temporarily unavailable.
+- Browser news refresh follows the configured 30-minute cadence instead of a fixed 5-minute loop.
+
+
 A stability-first Indian market analytics application centered on Upstox V3 live data, intraday candles, a calibrated ML model, Times of India headlines, FreeNewsApi, and optional X/Twitter context.
 
 ## Operating policy

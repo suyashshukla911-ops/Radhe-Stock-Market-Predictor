@@ -184,5 +184,5 @@ $("universe-search").addEventListener("keydown",e=>{if(e.key==="Enter")$("univer
 boot();
 setInterval(async()=>{await initialLive().catch(()=>{})},60000);
 setInterval(async()=>{if(!state.busy && Date.now()-state.lastAnalysisAt>=state.predictionCadenceMs){await analyze(false).catch(()=>{})}},60000);
-setInterval(async()=>{await newsRefresh().catch(()=>{})},300000);
+setInterval(async()=>{await newsRefresh().catch(()=>{})},1800000);
 setInterval(async()=>{await pulse().catch(()=>{})},300000);

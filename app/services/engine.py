@@ -107,17 +107,44 @@ class AnalysisEngine:
     def _live_snapshot(self,instrument,interval,ttl_seconds=None):
         ttl=settings.live_rest_cache_seconds if ttl_seconds is None else ttl_seconds
         self.live.subscribe([instrument.instrument_key])
-        live_1m=self.live.live_bars(instrument.instrument_key,1)
-        if not live_1m.empty:
-            return self.upstox.aggregate_minutes(live_1m,interval)
         cache_key=(instrument.instrument_key,interval)
+
+        # 1) Prefer the server-side WebSocket bars while the market is live.
+        try:
+            live_1m=self.live.live_bars(instrument.instrument_key,1)
+            if not live_1m.empty:
+                aggregated=self.upstox.aggregate_minutes(live_1m,interval)
+                if not aggregated.empty:
+                    self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
+                    return aggregated
+        except Exception:
+            pass
+
+        # 2) Reuse a recent REST snapshot before making another request.
         cached=self._live_view_cache.get(cache_key)
         if cached and time.time()-cached[0] < ttl:
             return cached[1].copy()
+
+        # 3) Current-day intraday endpoint. This can legitimately be empty after
+        # the cash market closes, so it is only the first REST fallback.
+        intraday=pd.DataFrame()
         try:
             intraday=self.upstox.get_intraday(instrument.instrument_key,interval)
         except Exception:
-            intraday=pd.DataFrame()
+            pass
+
+        # 4) IMPORTANT: after market close (or before the first live tick), use
+        # completed historical sessions so the UI keeps the last real candle
+        # instead of becoming blank or inventing an after-hours candle.
+        if intraday.empty:
+            try:
+                days=settings.train_days_short if interval <= 15 else min(settings.train_days_long,30)
+                historical=self.upstox.get_recent_history(instrument.instrument_key,interval,max(7,days))
+                if not historical.empty:
+                    intraday=historical
+            except Exception:
+                pass
+
         self._live_view_cache[cache_key]=(time.time(),intraday.copy())
         return intraday
 
@@ -219,7 +246,40 @@ class AnalysisEngine:
 
         if tick is None and not bars.empty:
             last=bars.iloc[-1]
-            tick={"price":float(last.close),"trade_time":pd.Timestamp(last.timestamp).isoformat(),"updated_at":now.isoformat(),"instrument_key":instrument.instrument_key,"session_trade":False}
+            last_ts=pd.Timestamp(last.timestamp)
+            if last_ts.tzinfo is None:
+                last_ts=last_ts.tz_localize(IST)
+            else:
+                last_ts=last_ts.tz_convert(IST)
+            tick={
+                "price":float(last.close),
+                "trade_time":last_ts.isoformat(),
+                # Keep the real candle timestamp so the UI shows a meaningful
+                # stale age after the market closes.
+                "updated_at":last_ts.isoformat(),
+                "instrument_key":instrument.instrument_key,
+                "session_trade":False,
+            }
+
+        # If the candle-history provider is temporarily empty, still show the
+        # latest quoted market price instead of a blank dashboard.
+        if tick is None:
+            try:
+                quotes=self.upstox.get_quote_batch([instrument.instrument_key])
+                q=quotes.get(instrument.instrument_key) or next(iter(quotes.values()), {})
+                last_price=q.get("last_price") or (q.get("ohlc") or {}).get("close")
+                prev_close=q.get("prev_close_price")
+                if last_price is not None:
+                    tick={
+                        "price":float(last_price),
+                        "previous_close":float(prev_close) if prev_close is not None else None,
+                        "trade_time":None,
+                        "updated_at":now.isoformat(),
+                        "instrument_key":instrument.instrument_key,
+                        "session_trade":False,
+                    }
+            except Exception:
+                pass
 
         current_candle=None
         seconds_left=0

@@ -126,7 +126,29 @@ def live_state(symbol:str=Query(...,min_length=1,max_length=100),interval:int=Qu
     try:
         ins=upstox.resolve_symbol(symbol)
         return engine.live_state(ins,interval)
-    except Exception as exc: raise HTTPException(503,str(exc))
+    except Exception as exc:
+        # Live state is a dashboard endpoint: never turn a temporary provider
+        # problem into a blank/erroring page. Return a structured 200 response
+        # so the UI can keep the last known state and retry on its normal cadence.
+        return {
+            "now": __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Kolkata")).isoformat(),
+            "instrument_key":"",
+            "symbol":symbol,
+            "tick":None,
+            "candles":[],
+            "current_candle":None,
+            "seconds_to_candle_close":0,
+            "prediction":None,
+            "market_data":{
+                "stream_connected":live.connected,
+                "stream_error":str(exc),
+                "last_update_age_seconds":None,
+                "source":"unavailable",
+                "market_status":"UNKNOWN",
+                "last_market_price":None,
+                "last_market_candle":None,
+            },
+        }
 
 @app.get("/auth/upstox/start")
 def upstox_start():
