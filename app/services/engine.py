@@ -46,6 +46,16 @@ class AnalysisEngine:
         m=now.hour*60+now.minute
         return 9*60+15 <= m < 15*60+30
 
+    @staticmethod
+    def _last_completed_session_date():
+        now=datetime.now(ZoneInfo(IST))
+        candidate=now.date()
+        if now.weekday()>=5 or (now.hour*60+now.minute) < 15*60+30:
+            candidate=(now - pd.Timedelta(days=1)).date()
+        while candidate.weekday()>=5:
+            candidate=(pd.Timestamp(candidate)-pd.Timedelta(days=1)).date()
+        return candidate
+
     def _history_window(self, interval):
         if interval == "1d":
             return max(365, settings.train_days_long * 4)
@@ -113,48 +123,66 @@ class AnalysisEngine:
         ttl=settings.live_rest_cache_seconds if ttl_seconds is None else ttl_seconds
         self.live.subscribe([instrument.instrument_key])
         cache_key=(instrument.instrument_key,interval)
+        open_now=self._market_open()
 
+        # During market hours, prefer the server-side websocket, then the
+        # current-day intraday endpoint. After close, always use the last
+        # completed cash session so 5/10/15/30/60m views are consistent.
+        if open_now:
+            try:
+                live_1m=self.live.live_bars(instrument.instrument_key,1)
+                if not live_1m.empty:
+                    aggregated=(self.upstox.aggregate_minutes(live_1m,1440) if interval == "1d"
+                                else self.upstox.aggregate_minutes(live_1m,int(interval)))
+                    if not aggregated.empty:
+                        self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
+                        return aggregated
+            except Exception:
+                pass
+
+            cached=self._live_view_cache.get(cache_key)
+            if cached and time.time()-cached[0] < ttl:
+                return cached[1].copy()
+
+            try:
+                intraday=self.upstox.get_intraday(instrument.instrument_key,interval)
+                if not intraday.empty:
+                    self._live_view_cache[cache_key]=(time.time(),intraday.copy())
+                    return intraday
+            except Exception:
+                pass
+            return cached[1].copy() if cached else pd.DataFrame()
+
+        # CLOSED/WEEKEND: use only the latest completed session. This prevents
+        # old sessions from being concatenated together in 60m/30m/15m views
+        # and makes the probability/chart stable outside market hours.
+        cached=self._live_view_cache.get(cache_key)
+        if cached and time.time()-cached[0] < ttl:
+            return cached[1].copy()
+
+        session_date=self._last_completed_session_date()
         try:
-            live_1m=self.live.live_bars(instrument.instrument_key,1)
-            if not live_1m.empty:
-                aggregated=(self.upstox.aggregate_minutes(live_1m,1440) if interval == "1d"
-                            else self.upstox.aggregate_minutes(live_1m,int(interval)))
+            if interval == "1d":
+                daily=self.upstox.get_daily_history(instrument.instrument_key,max(30,settings.train_days_long))
+                if not daily.empty:
+                    daily["timestamp"]=pd.to_datetime(daily["timestamp"],utc=True).dt.tz_convert(IST)
+                    daily=daily[daily["timestamp"].dt.date <= session_date].tail(settings.chart_bars)
+                    self._live_view_cache[cache_key]=(time.time(),daily.copy())
+                    return daily
+            # Use 1-minute history to build the requested intraday timeframe
+            # for exactly the last completed session.
+            base=self.upstox.get_recent_history(instrument.instrument_key,1,7)
+            if not base.empty:
+                base["timestamp"]=pd.to_datetime(base["timestamp"],utc=True).dt.tz_convert(IST)
+                base=base[base["timestamp"].dt.date == session_date].copy()
+                aggregated=self.upstox.aggregate_minutes(base,int(interval))
                 if not aggregated.empty:
                     self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
                     return aggregated
         except Exception:
             pass
 
-        # 2) Reuse a recent REST snapshot before making another request.
-        cached=self._live_view_cache.get(cache_key)
-        if cached and time.time()-cached[0] < ttl:
-            return cached[1].copy()
-
-        # 3) Current-day intraday endpoint. This can legitimately be empty after
-        # the cash market closes, so it is only the first REST fallback.
-        intraday=pd.DataFrame()
-        try:
-            intraday=self.upstox.get_intraday(instrument.instrument_key,interval)
-        except Exception:
-            pass
-
-        # 4) IMPORTANT: after market close (or before the first live tick), use
-        # completed historical sessions so the UI keeps the last real candle
-        # instead of becoming blank or inventing an after-hours candle.
-        if intraday.empty:
-            try:
-                if interval == "1d":
-                    days=max(365, settings.train_days_long * 4)
-                else:
-                    days=settings.train_days_short if int(interval) <= 15 else min(settings.train_days_long,30)
-                historical=self.upstox.get_recent_history(instrument.instrument_key,interval,max(7,days))
-                if not historical.empty:
-                    intraday=historical
-            except Exception:
-                pass
-
-        self._live_view_cache[cache_key]=(time.time(),intraday.copy())
-        return intraday
+        return cached[1].copy() if cached else pd.DataFrame()
 
     def _merge_training_and_live(self,instrument,interval):
         history_cache=self._get_history(instrument,interval,self._history_window(interval))
@@ -170,10 +198,19 @@ class AnalysisEngine:
         key=(instrument.instrument_key,interval)
         with self._analysis_lock:
             # Reuse a recent result instead of refitting/re-hitting external services.
+            # Once the cash session is closed, freeze the last result for that
+            # instrument/timeframe until the next trading session. This keeps
+            # the displayed probability from drifting after the market closes.
             cached=self.last_results.get(key)
+            today=datetime.now(ZoneInfo(IST)).date()
             if cached and not force_retrain:
                 age=time.time()-cached["_created_at"]
-                if (not self._market_open()) or age < settings.prediction_refresh_seconds:
+                cached_session=cached.get("session_date")
+                if not self._market_open():
+                    return {k:v for k,v in cached.items() if k!="_created_at"}
+                if cached_session != str(today):
+                    cached=None
+                elif age < settings.prediction_refresh_seconds:
                     return {k:v for k,v in cached.items() if k!="_created_at"}
 
             model_cache=self._get_training_cache(instrument,interval,force=force_retrain)
@@ -206,6 +243,7 @@ class AnalysisEngine:
             result={
                 "instrument":{"name":instrument.name,"short_name":instrument.short_name,"symbol":instrument.trading_symbol,"exchange":instrument.exchange,"segment":instrument.segment,"instrument_key":instrument.instrument_key,"sector":SECTOR_BY_SYMBOL.get(instrument.trading_symbol.upper(),"Market Index" if instrument.segment.endswith("INDEX") else "Unknown")},
                 "interval":interval,
+                "session_date":str(datetime.now(ZoneInfo(IST)).date()),
                 "last_timestamp":latest["timestamp"].iloc[0].isoformat(),
                 "current_price":current_price,
                 "candles":rows,
@@ -352,7 +390,7 @@ class AnalysisEngine:
                 "stream_connected":self.live.connected,
                 "stream_error":self.live.last_error,
                 "last_update_age_seconds":age,
-                "source":"websocket" if self.live.connected and tick and open_now else "rest-last-session" if bars.size else "unavailable",
+                "source":"websocket" if self.live.connected and tick and open_now else "last-completed-session" if bars.size else "unavailable",
                 "market_status":status,
                 "last_market_price":float(bars.iloc[-1]["close"]) if not bars.empty else None,
                 "last_market_candle":bars.iloc[-1]["timestamp"].isoformat() if not bars.empty else None,

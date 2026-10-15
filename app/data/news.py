@@ -57,15 +57,36 @@ def source_weight(publisher: str) -> float:
         if name in low: return weight
     return 0.65
 
+DISPLAY_SECTIONS = {"business","india business","international business","economy","markets","technology","tech news"}
+
 def relevance_score(title: str, symbol: str, company: str, section: str = "") -> float:
     low = title.lower()
-    s = 0.0
-    for term in {symbol.lower(), company.lower(), company.lower().replace(" limited","").strip()}:
-        if term and len(term) > 2 and term in low: s += 2.0
-    if any(term in low for term in MARKET_TERMS): s += 0.8
-    sec = section.lower()
-    if any(x in sec for x in ("business","market","economy","world")): s += 0.4
-    return s
+    sec = (section or "").lower().strip()
+    score = 0.0
+    terms = {symbol.lower(), company.lower(), company.lower().replace(" limited", "").strip()}
+    for term in terms:
+        if term and len(term) > 2 and term in low:
+            score += 3.0
+    if any(term in low for term in MARKET_TERMS):
+        score += 1.7
+    if sec in DISPLAY_SECTIONS:
+        score += 2.5
+    elif sec.startswith("world") or sec in {"us","pakistan","south asia","uk","europe","china","middle east","rest of world"}:
+        score -= 2.5
+    return score
+
+def display_rank_score(row: dict, symbol: str, company: str) -> float:
+    title = row.get("title", "")
+    section = row.get("section", "")
+    score = relevance_score(title, symbol, company, section)
+    published = row.get("published_at") or row.get("scraped_at") or ""
+    try:
+        ts = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        age_h = max(0.0, (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds() / 3600)
+        freshness = math.exp(-age_h / 18.0)
+    except Exception:
+        freshness = 0.35
+    return score + freshness
 
 @dataclass
 class NewsQuota:
@@ -323,8 +344,19 @@ class NewsService:
             item=dict(row)
             item["relevance"]=relevance_score(item.get("title",""),symbol,company,item.get("section",""))
             ranked.append(item)
-        ranked.sort(key=lambda x:(float(x.get("relevance",0)),x.get("scraped_at","")),reverse=True)
-        return {"articles":ranked[:10],"fetched_at":toi.fetched_at if toi else None,"sections_ok":toi.sections_ok if toi else 0,"sections_total":toi.sections_total if toi else len(__import__('app.data.toi',fromlist=['SECTIONS']).SECTIONS),"download_url":"/api/news/download"}
+        market_rows=[x for x in ranked if (x.get("section","").lower() in DISPLAY_SECTIONS)]
+        ranked_pool=market_rows if len(market_rows) >= 5 else ranked
+        ranked_pool.sort(key=lambda x:display_rank_score(x,symbol,company),reverse=True)
+        return {"articles":ranked_pool[:10],"fetched_at":toi.fetched_at if toi else None,"sections_ok":toi.sections_ok if toi else 0,"sections_total":toi.sections_total if toi else len(__import__('app.data.toi',fromlist=['SECTIONS']).SECTIONS),"download_url":"/api/news/download"}
+
+    def refresh_toi(self):
+        snap=self._toi.refresh()
+        return {
+            "fetched_at":snap.fetched_at,
+            "sections_ok":snap.sections_ok,
+            "sections_total":snap.sections_total,
+            "headline_count":len(snap.headlines),
+        }
 
     def diagnostics(self):
         toi=self._toi.get()

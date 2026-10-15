@@ -116,6 +116,14 @@ def news_download():
     except Exception as exc:
         raise HTTPException(503,str(exc))
 
+@app.get("/api/news/refresh")
+def news_refresh():
+    try:
+        result=news.refresh_toi()
+        return {"ok":True,**result}
+    except Exception as exc:
+        raise HTTPException(503,str(exc))
+
 @app.get("/api/news/quota")
 def news_quota(): return news.diagnostics()
 

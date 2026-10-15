@@ -16,7 +16,7 @@ function drawChart(rows,pred){
   if(!rows?.length){Plotly.purge("chart");return}
   const trace={x:rows.map(r=>r.time),open:rows.map(r=>r.open),high:rows.map(r=>r.high),low:rows.map(r=>r.low),close:rows.map(r=>r.close),type:"candlestick",name:"Market",increasing:{line:{color:"#15966b"}},decreasing:{line:{color:"#d64550"}}};
   const last=rows[rows.length-1].time;
-  const layout={paper_bgcolor:"#ffffff",plot_bgcolor:"#ffffff",margin:{l:54,r:18,t:10,b:38},xaxis:{rangeslider:{visible:false},gridcolor:"#e9edf2",color:"#5b6b7d"},yaxis:{gridcolor:"#e9edf2",color:"#5b6b7d"},font:{color:"#17324d"},showlegend:false};
+  const layout={paper_bgcolor:"#ffffff",plot_bgcolor:"#ffffff",margin:{l:54,r:18,t:10,b:38},dragmode:"pan",uirevision:`${state.symbol}-${state.interval}`,xaxis:{rangeslider:{visible:false},gridcolor:"#e9edf2",color:"#5b6b7d",fixedrange:false},yaxis:{gridcolor:"#e9edf2",color:"#5b6b7d",fixedrange:false},font:{color:"#17324d"},showlegend:false};
   const shapes=[];
   if(pred){
     [["predicted_close","#2563eb"],["predicted_high","#15966b"],["predicted_low","#d64550"]].forEach(([k,c])=>{
@@ -24,7 +24,7 @@ function drawChart(rows,pred){
     });
   }
   layout.shapes=shapes;
-  Plotly.react("chart",[trace],layout,{displaylogo:false,responsive:true});
+  Plotly.react("chart",[trace],layout,{displaylogo:false,responsive:true,displayModeBar:false,doubleClick:"reset",scrollZoom:false});
 }
 
 function clearPrediction(){
@@ -50,7 +50,7 @@ function renderNews(n){
   const toi=n?.toi||{};
   $("news-score").textContent=`${rows.length} top stories`;
   $("news-score").className="pill good";
-  $("news-summary").innerHTML=[["Top stories",rows.length],["Source","Times of India"],["Updated",toi.fetched_at?new Date(toi.fetched_at).toLocaleTimeString("en-IN")||"—":"—"],["Download","Excel"]].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");
+  $("news-summary").innerHTML=[["Top stories",rows.length],["Source","Times of India"],["Updated",toi.fetched_at?new Date(toi.fetched_at).toLocaleTimeString("en-IN")||"—":"—"],["Coverage",`${toi.sections_ok||0}/${toi.sections_total||0} sections`]].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");
   $("news-list").innerHTML=rows.map((a,i)=>{
     const when=a.scraped_at||"";
     return `<article class="news-item"><div class="news-rank">${i+1}</div><div><a href="${esc(a.url||"#")}" target="_blank" rel="noopener">${esc(a.title||"")}</a><div class="news-meta"><span>${esc(a.section||"Markets")}</span><span>${when?new Date(when).toLocaleString("en-IN"):"Latest"}</span></div></div></article>`;
@@ -78,7 +78,7 @@ function renderAnalysis(d){
   $("probability").className="pill "+(up>=.65?"good":up<=.35?"bad":"warn");
   $("up-p").textContent=(up*100).toFixed(1)+"%";
   $("down-p").textContent=((1-up)*100).toFixed(1)+"% down";
-  $("model-status").textContent=v.gate_90_passed?"QUALIFIED":"REVALIDATE";
+  $("model-status").textContent=v.gate_90_passed?"SIGNAL ELIGIBLE":"REVALIDATE";
   $("model-age").textContent=`Model age: ${Math.round(d.market_state.model_cache_age_seconds)}s · retrain ${d.market_state.model_retrain_minutes}m`;
   $("policy-box").textContent=`Refresh policy: UI ${d.refresh_policy.browser_seconds}s · prediction ${d.refresh_policy.prediction_seconds}s · news ${d.refresh_policy.news_minutes}m · TOI ${d.refresh_policy.toi_minutes}m.`;
   renderValidation(v); renderNews(d.news); drawChart(d.candles,p); state.lastAnalysisAt=Date.now();
@@ -89,7 +89,7 @@ function renderLive(d){
   if(live)$("current").textContent=fmt(d.tick.price);
   else if(d.market_data?.last_market_price!=null)$("current").textContent=fmt(d.market_data.last_market_price);
   $("price-label").textContent=status==="OPEN"?"LIVE PRICE":"LAST MARKET PRICE";
-  $("status").textContent=status==="OPEN"?(d.market_data.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · REST RECOVERY"):`● MARKET ${status} · LAST SESSION`;
+  $("status").textContent=status==="OPEN"?(d.market_data.stream_connected?"● MARKET OPEN · LIVE DATA":"○ MARKET OPEN · RECOVERING LIVE DATA"):`● MARKET ${status} · LAST COMPLETED SESSION`;
   $("status").className=status==="OPEN"?"status live":"status closed";
   const age=d.market_data.last_update_age_seconds;
   $("feed-age").textContent=age==null?"—":`${age.toFixed(1)}s`;
@@ -102,7 +102,7 @@ function renderLive(d){
   if(d.view_only){
     $("title").textContent=`${d.symbol} · 1D`;
     $("next-close").textContent="—"; $("next-high").textContent="—"; $("next-low").textContent="—"; $("eod-close").textContent="—";
-    $("signal").textContent="VIEW ONLY"; $("signal-note").textContent="Previous-session history";
+    $("signal").textContent="HISTORY"; $("signal-note").textContent="Last completed session";
     $("model-status").textContent="DAILY HISTORY"; $("model-age").textContent="Select an intraday timeframe for prediction";
     $("validation").innerHTML=""; $("policy-box").textContent="Daily view shows previous sessions; intraday timeframes are used for predictions.";
     $("timestamp").textContent=d.current_candle?.start?`Last session ${new Date(d.current_candle.start).toLocaleDateString("en-IN")}`:"Last session";
@@ -139,7 +139,18 @@ async function pulse(){
   }catch(e){$("pulse-grid").innerHTML=`<div class="muted">${esc(e.message)}</div>`}
 }
 async function newsRefresh(){
-  try{const d=await getJSON(`/api/news?symbol=${encodeURIComponent(state.symbol)}&name=${encodeURIComponent(state.symbol)}`);renderNews(d)}catch(e){$("news-quota").textContent=e.message}
+  try{const d=await getJSON(`/api/news?symbol=${encodeURIComponent(state.symbol)}&name=${encodeURIComponent(state.symbol)}`);renderNews(d)}catch(e){$("news-quota").textContent=`Market news unavailable: ${e.message}`}
+}
+async function manualNewsRefresh(){
+  const btn=$("news-refresh");
+  if(!btn)return;
+  btn.disabled=true; btn.textContent="REFRESHING…";
+  try{
+    const r=await getJSON("/api/news/refresh");
+    await newsRefresh();
+    $("news-quota").textContent=`Latest Times of India update: ${r.fetched_at?new Date(r.fetched_at).toLocaleString("en-IN"):"just now"}`;
+  }catch(e){$("news-quota").textContent=`News refresh failed: ${e.message}`}
+  finally{btn.disabled=false;btn.textContent="REFRESH NEWS"}
 }
 async function loadUniverse(query=""){
   const button=$("universe-search-btn"), status=$("search-status");
