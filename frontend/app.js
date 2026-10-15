@@ -1,5 +1,5 @@
 const $=id=>document.getElementById(id);
-const state={symbol:"SENSEX",interval:"5",lastAnalysis:null,lastAnalysisAt:0,lastInstrumentKey:null,busy:false,predictionCadenceMs:300000};
+const state={symbol:"SENSEX",interval:"5",lastAnalysis:null,lastAnalysisAt:0,lastInstrumentKey:null,busy:false,predictionCadenceMs:300000,marketOpen:false};
 
 function fmt(v,d=2){return Number.isFinite(Number(v))?Number(v).toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d}):"—"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -24,7 +24,7 @@ function drawChart(rows,pred){
     });
   }
   layout.shapes=shapes;
-  Plotly.react("chart",[trace],layout,{displaylogo:false,responsive:true,displayModeBar:false,doubleClick:"reset",scrollZoom:false});
+  Plotly.react("chart",[trace],layout,{displaylogo:false,responsive:true,displayModeBar:false,doubleClick:"reset",scrollZoom:true});
 }
 
 function clearPrediction(){
@@ -85,31 +85,76 @@ function renderAnalysis(d){
 }
 function renderLive(d){
   const status=d.market_data?.market_status||"UNKNOWN";
+  state.marketOpen=status==="OPEN";
   const live=Boolean(d.tick&&Number.isFinite(Number(d.tick.price)));
+  const lastCandle=d.current_candle;
+
   if(live)$("current").textContent=fmt(d.tick.price);
   else if(d.market_data?.last_market_price!=null)$("current").textContent=fmt(d.market_data.last_market_price);
-  $("price-label").textContent=status==="OPEN"?"LIVE PRICE":"LAST MARKET PRICE";
+
+  $("price-label").textContent=status==="OPEN"?"LIVE PRICE":state.interval==="1d"?"PREVIOUS SESSION CLOSE":"LAST CANDLE CLOSE";
   $("status").textContent=status==="OPEN"?(d.market_data.stream_connected?"● MARKET OPEN · LIVE DATA":"○ MARKET OPEN · RECOVERING LIVE DATA"):`● MARKET ${status} · LAST COMPLETED SESSION`;
   $("status").className=status==="OPEN"?"status live":"status closed";
+
   const age=d.market_data.last_update_age_seconds;
   $("feed-age").textContent=age==null?"—":`${age.toFixed(1)}s`;
-  if(d.current_candle){
-    $("candle-clock").textContent=candleLabel(d.current_candle.start,d.current_candle.end,d.seconds_to_candle_close,d.current_candle.forming);
-    $("candle-label").textContent=candleLabel(d.current_candle.start,d.current_candle.end,d.seconds_to_candle_close,d.current_candle.forming);
+
+  if(lastCandle){
+    if(state.interval==="1d"){
+      const day=new Date(lastCandle.start).toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});
+      $("candle-clock").textContent=`Previous session · ${day}`;
+      $("candle-label").textContent=`Previous completed session · ${day}`;
+      $("title").textContent=`${d.symbol} · 1D`;
+    }else{
+      $("candle-clock").textContent=candleLabel(lastCandle.start,lastCandle.end,d.seconds_to_candle_close,lastCandle.forming);
+      $("candle-label").textContent=candleLabel(lastCandle.start,lastCandle.end,d.seconds_to_candle_close,lastCandle.forming);
+      $("title").textContent=`${d.symbol} · ${state.interval}m`;
+    }
   }
-  if(d.tick?.trade_time)$("timestamp").textContent=status==="OPEN"?`Live ${new Date(d.tick.trade_time).toLocaleTimeString("en-IN")}`:`Last trade ${new Date(d.tick.trade_time).toLocaleString("en-IN")}`;
-  if(d.candles?.length && !state.lastAnalysis)drawChart(d.candles,null);
-  if(d.view_only){
-    $("title").textContent=`${d.symbol} · 1D`;
-    $("next-close").textContent="—"; $("next-high").textContent="—"; $("next-low").textContent="—"; $("eod-close").textContent="—";
-    $("signal").textContent="HISTORY"; $("signal-note").textContent="Last completed session";
-    $("model-status").textContent="DAILY HISTORY"; $("model-age").textContent="Select an intraday timeframe for prediction";
-    $("validation").innerHTML=""; $("policy-box").textContent="Daily view shows previous sessions; intraday timeframes are used for predictions.";
-    $("timestamp").textContent=d.current_candle?.start?`Last session ${new Date(d.current_candle.start).toLocaleDateString("en-IN")}`:"Last session";
-  }
-  if(d.prediction && !state.lastAnalysis){
-    const fake={...d,prediction:d.prediction,last_timestamp:d.current_candle?.start||d.tick?.trade_time,current_price:d.tick?.price??d.market_data.last_market_price,candles:d.candles,instrument:{name:d.symbol},interval:state.interval,news:{summary:{},articles:[],diagnostics:{}},market_state:{market_status:status,model_cache_age_seconds:0,model_retrain_minutes:30},refresh_policy:{browser_seconds:60,prediction_seconds:300,news_minutes:30,toi_minutes:10}};
-    renderAnalysis(fake);
+
+  if(d.tick?.trade_time)$("timestamp").textContent=status==="OPEN"?`Live ${new Date(d.tick.trade_time).toLocaleTimeString("en-IN")}`:`Last market trade ${new Date(d.tick.trade_time).toLocaleString("en-IN")}`;
+
+  if(d.candles?.length)drawChart(d.candles, state.marketOpen && state.lastAnalysis ? state.lastAnalysis.prediction : null);
+
+  if(status!=="OPEN"){
+    // Never carry live prediction numbers into after-hours mode.
+    state.lastAnalysis=null; state.lastAnalysisAt=0;
+    if(state.interval==="1d"){
+      $("price-label").textContent="PREVIOUS SESSION CLOSE";
+      $("current").textContent=d.market_data?.last_market_price!=null?fmt(d.market_data.last_market_price):"—";
+      $("timestamp").textContent=lastCandle?.start?`Previous session ${new Date(lastCandle.start).toLocaleDateString("en-IN")}`:"Previous session";
+      $("next-close").textContent="—"; $("next-high").textContent="—"; $("next-low").textContent="—"; $("eod-close").textContent="—";
+      $("signal").textContent="HISTORY"; $("signal-note").textContent="Previous completed session";
+      $("model-status").textContent="DAILY HISTORY"; $("model-age").textContent="Select an intraday timeframe during market hours for prediction";
+      $("up-p").textContent="—"; $("down-p").textContent="—"; $("probability").textContent="HISTORY";
+      $("policy-box").textContent="Daily history view. Select 1m–60m while the market is open for a model forecast.";
+      $("validation").innerHTML="";
+    }else{
+      $("price-label").textContent="LAST CANDLE CLOSE";
+      if(lastCandle){
+        $("current").textContent=fmt(lastCandle.close);
+        $("next-close").textContent=fmt(lastCandle.close);
+        $("next-high").textContent=fmt(lastCandle.high);
+        $("next-low").textContent=fmt(lastCandle.low);
+        $("eod-close").textContent=fmt(lastCandle.close);
+        $("next-close-label").textContent="last completed candle close";
+        $("next-high-label-title").textContent="LAST CANDLE HIGH";
+        $("next-low-label-title").textContent="LAST CANDLE LOW";
+        $("next-close-label-title").textContent="LAST CANDLE CLOSE";
+        $("eod-label-title").textContent="LAST SESSION CLOSE";
+      }
+      $("signal").textContent="HISTORY"; $("signal-note").textContent="Last completed session";
+      $("up-p").textContent="—"; $("down-p").textContent="—"; $("probability").textContent="MARKET CLOSED";
+      $("model-status").textContent="MARKET CLOSED"; $("model-age").textContent="Prediction available during market hours";
+      $("policy-box").textContent="Live price/candles remain visible. Next-candle predictions are enabled only while the market is open.";
+      $("validation").innerHTML="";
+    }
+  }else{
+    $("next-close-label-title").textContent="NEXT CANDLE CLOSE";
+    $("next-high-label-title").textContent="NEXT CANDLE HIGH";
+    $("next-low-label-title").textContent="NEXT CANDLE LOW";
+    $("eod-label-title").textContent="END-OF-DAY OUTLOOK";
+    $("next-close-label").textContent="model estimate for selected timeframe";
   }
 }
 async function initialLive(){
@@ -119,6 +164,11 @@ async function initialLive(){
 async function analyze(force=false){
   if(state.busy)return;
   if(state.interval==="1d"){await initialLive();return;}
+  if(!state.marketOpen){
+    $("status").textContent="● MARKET CLOSED · predictions resume at 09:15 IST";
+    $("status").className="status closed";
+    return;
+  }
   state.busy=true;
   $("analyze").disabled=true; $("retrain").disabled=true;
   $("status").textContent=force?`RETRAINING ${state.symbol}…`:`ANALYZING ${state.symbol} ${state.interval}m…`;
@@ -135,7 +185,7 @@ async function pulse(){
   try{
     const d=await getJSON("/api/market-pulse?limit=30");
     $("pulse-grid").innerHTML=(d.results||[]).slice(0,20).map(x=>`<button class="pulse-item" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name)}</span><strong class="${Number(x.change_pct)>=0?"up":"down"}">${x.change_pct==null?"—":(Number(x.change_pct)>=0?"+":"")+Number(x.change_pct).toFixed(2)+"%"}</strong><small>${x.price==null?"—":fmt(x.price)}</small></button>`).join("");
-    document.querySelectorAll(".pulse-item").forEach(b=>b.addEventListener("click",async()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;clearPrediction();$("status").textContent=`LOADING ${state.symbol}…`;window.scrollTo({top:0,behavior:"smooth"});await initialLive().catch(()=>{});if(state.interval!=="1d")await analyze(false)}));
+    document.querySelectorAll(".pulse-item").forEach(b=>b.addEventListener("click",async()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;clearPrediction();$("status").textContent=`LOADING ${state.symbol}…`;window.scrollTo({top:0,behavior:"smooth"});await initialLive().catch(()=>{});if(state.interval!=="1d" && state.marketOpen)await analyze(false)}));
   }catch(e){$("pulse-grid").innerHTML=`<div class="muted">${esc(e.message)}</div>`}
 }
 async function newsRefresh(){
@@ -165,7 +215,7 @@ async function loadUniverse(query=""){
 }
 function renderUniverse(rows){
   $("universe-results").innerHTML=(rows||[]).slice(0,60).map(x=>`<button class="stock-row" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name||"")}</span><small>${esc(x.exchange||"")}</small></button>`).join("")||`<div class="muted">No securities matched.</div>`;
-  document.querySelectorAll(".stock-row").forEach(b=>b.addEventListener("click",async()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;$("search-status").textContent=`Selected ${state.symbol}. Loading market data…`;clearPrediction();window.scrollTo({top:0,behavior:"smooth"});await initialLive().catch(()=>{});if(state.interval!=="1d")await analyze(false)}));
+  document.querySelectorAll(".stock-row").forEach(b=>b.addEventListener("click",async()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;$("search-status").textContent=`Selected ${state.symbol}. Loading market data…`;clearPrediction();window.scrollTo({top:0,behavior:"smooth"});await initialLive().catch(()=>{});if(state.interval!=="1d" && state.marketOpen)await analyze(false)}));
 }
 async function boot(){
   try{
@@ -175,7 +225,7 @@ async function boot(){
     const p=await getJSON("/api/priority");
     $("priority-list").innerHTML=p.stocks.map(s=>`<option value="${esc(s.symbol)}">${esc(s.name)}</option>`).join("");
     await initialLive();
-    await analyze(false);
+    if(state.marketOpen) await analyze(false);
     await newsRefresh();
     await pulse();
     await loadUniverse();
@@ -195,8 +245,8 @@ async function refreshAll(){
 
 $("analyze").addEventListener("click",()=>analyze(false));
 $("retrain").addEventListener("click",()=>analyze(true));
-$("interval").addEventListener("change",async()=>{state.interval=$("interval").value;clearPrediction();$("retrain").disabled=state.interval==="1d";$("status").textContent=`LOADING ${state.interval.toUpperCase()}…`;await initialLive();if(state.interval!=="1d")await analyze(false)});
-$("symbol").addEventListener("change",async()=>{state.symbol=($("symbol").value||"SENSEX").trim();clearPrediction();$("status").textContent=`LOADING ${state.symbol.toUpperCase()}…`;await initialLive();if(state.interval!=="1d")await analyze(false)});
+$("interval").addEventListener("change",async()=>{state.interval=$("interval").value;clearPrediction();$("retrain").disabled=state.interval==="1d";$("status").textContent=`LOADING ${state.interval.toUpperCase()}…`;await initialLive();if(state.interval!=="1d" && state.marketOpen)await analyze(false)});
+$("symbol").addEventListener("change",async()=>{state.symbol=($("symbol").value||"SENSEX").trim();clearPrediction();$("status").textContent=`LOADING ${state.symbol.toUpperCase()}…`;await initialLive();if(state.interval!=="1d" && state.marketOpen)await analyze(false)});
 $("symbol").addEventListener("keydown",e=>{if(e.key==="Enter")$("symbol").dispatchEvent(new Event("change"))});
 $("pulse").addEventListener("click",pulse);
 $("universe-search-btn").addEventListener("click",()=>loadUniverse($("universe-search").value.trim()));
@@ -204,6 +254,6 @@ $("universe-search").addEventListener("keydown",e=>{if(e.key==="Enter")$("univer
 
 boot();
 setInterval(async()=>{await initialLive().catch(()=>{})},60000);
-setInterval(async()=>{if(!state.busy && Date.now()-state.lastAnalysisAt>=state.predictionCadenceMs){await analyze(false).catch(()=>{})}},60000);
+setInterval(async()=>{if(state.marketOpen && !state.busy && Date.now()-state.lastAnalysisAt>=state.predictionCadenceMs){await analyze(false).catch(()=>{})}},60000);
 setInterval(async()=>{await newsRefresh().catch(()=>{})},600000);
 setInterval(async()=>{await pulse().catch(()=>{})},300000);

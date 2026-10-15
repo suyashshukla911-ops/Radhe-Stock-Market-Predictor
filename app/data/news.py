@@ -57,7 +57,7 @@ def source_weight(publisher: str) -> float:
         if name in low: return weight
     return 0.65
 
-DISPLAY_SECTIONS = {"business","india business","international business","economy","markets","technology","tech news"}
+DISPLAY_SECTIONS = {"business","india business","international business","economy","markets"}
 
 def relevance_score(title: str, symbol: str, company: str, section: str = "") -> float:
     low = title.lower()

@@ -56,6 +56,17 @@ class AnalysisEngine:
             candidate=(pd.Timestamp(candidate)-pd.Timedelta(days=1)).date()
         return candidate
 
+    @staticmethod
+    def _session_dates(df: pd.DataFrame) -> list:
+        if df.empty or "timestamp" not in df.columns:
+            return []
+        data=df.copy()
+        ts=pd.to_datetime(data["timestamp"],utc=True).dt.tz_convert(IST)
+        mins=ts.dt.hour*60+ts.dt.minute
+        data["session_date"]=ts.dt.date
+        mask=(mins>=9*60+15)&(mins<15*60+30)&(ts.dt.dayofweek<5)
+        return sorted(data.loc[mask,"session_date"].dropna().unique().tolist())
+
     def _history_window(self, interval):
         if interval == "1d":
             return max(365, settings.train_days_long * 4)
@@ -125,62 +136,100 @@ class AnalysisEngine:
         cache_key=(instrument.instrument_key,interval)
         open_now=self._market_open()
 
-        # During market hours, prefer the server-side websocket, then the
-        # current-day intraday endpoint. After close, always use the last
-        # completed cash session so 5/10/15/30/60m views are consistent.
         if open_now:
+            # Keep the full current session visible. The WebSocket is the realtime
+            # source, while the one-minute intraday endpoint supplies any session
+            # history that arrived before this process subscribed.
+            ws=pd.DataFrame()
             try:
-                live_1m=self.live.live_bars(instrument.instrument_key,1)
-                if not live_1m.empty:
-                    aggregated=(self.upstox.aggregate_minutes(live_1m,1440) if interval == "1d"
-                                else self.upstox.aggregate_minutes(live_1m,int(interval)))
-                    if not aggregated.empty:
-                        self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
-                        return aggregated
+                ws=self.live.live_bars(instrument.instrument_key,1)
             except Exception:
-                pass
-
+                ws=pd.DataFrame()
+            rest=pd.DataFrame()
             cached=self._live_view_cache.get(cache_key)
             if cached and time.time()-cached[0] < ttl:
                 return cached[1].copy()
 
             try:
-                intraday=self.upstox.get_intraday(instrument.instrument_key,interval)
-                if not intraday.empty:
-                    self._live_view_cache[cache_key]=(time.time(),intraday.copy())
-                    return intraday
+                rest=self.upstox.get_intraday(instrument.instrument_key,1)
             except Exception:
-                pass
-            return cached[1].copy() if cached else pd.DataFrame()
+                rest=pd.DataFrame()
 
-        # CLOSED/WEEKEND: use only the latest completed session. This prevents
-        # old sessions from being concatenated together in 60m/30m/15m views
-        # and makes the probability/chart stable outside market hours.
+            # Prefer provider-built intraday candles for OHLC integrity. The
+            # WebSocket remains the live tick source and becomes a candle source
+            # only when the REST intraday snapshot is unavailable.
+            frames=[rest] if not rest.empty else ([ws] if not ws.empty else [])
+            if frames:
+                base=frames[0].copy()
+                base["timestamp"]=pd.to_datetime(base["timestamp"],utc=True).dt.tz_convert(IST)
+                # Only the current cash session is used for the live chart.
+                today=datetime.now(ZoneInfo(IST)).date()
+                mins=base["timestamp"].dt.hour*60+base["timestamp"].dt.minute
+                base=base.loc[
+                    (base["timestamp"].dt.date==today)
+                    &(mins>=9*60+15)&(mins<15*60+30)
+                ].copy()
+                if not base.empty:
+                    base=base.sort_values("timestamp").drop_duplicates("timestamp",keep="last")
+                    aggregated=self.upstox.aggregate_minutes(base,int(interval))
+                    if not aggregated.empty:
+                        self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
+                        return aggregated.copy()
+
+            cached=self._live_view_cache.get(cache_key)
+            if cached:
+                return cached[1].copy()
+            return pd.DataFrame()
+
+        # CLOSED/WEEKEND: prefer today's already-completed session if Upstox has
+        # published it. This is the key distinction from the 1D history view:
+        # intraday 1/5/10/15/30/60m should end with today's final cash-market bar.
         cached=self._live_view_cache.get(cache_key)
         if cached and time.time()-cached[0] < ttl:
             return cached[1].copy()
 
-        session_date=self._last_completed_session_date()
+        today=datetime.now(ZoneInfo(IST)).date()
+        base=pd.DataFrame()
         try:
-            if interval == "1d":
-                daily=self.upstox.get_daily_history(instrument.instrument_key,max(30,settings.train_days_long))
-                if not daily.empty:
-                    daily["timestamp"]=pd.to_datetime(daily["timestamp"],utc=True).dt.tz_convert(IST)
-                    daily=daily[daily["timestamp"].dt.date <= session_date].tail(settings.chart_bars)
-                    self._live_view_cache[cache_key]=(time.time(),daily.copy())
-                    return daily
-            # Use 1-minute history to build the requested intraday timeframe
-            # for exactly the last completed session.
-            base=self.upstox.get_recent_history(instrument.instrument_key,1,7)
+            base=self.upstox.get_intraday(instrument.instrument_key,1)
+        except Exception:
+            base=pd.DataFrame()
+
+        if base.empty:
+            try:
+                base=self.upstox.get_recent_history(instrument.instrument_key,1,7)
+            except Exception:
+                base=pd.DataFrame()
+
+        if not base.empty:
+            base["timestamp"]=pd.to_datetime(base["timestamp"],utc=True).dt.tz_convert(IST)
+            mins=base["timestamp"].dt.hour*60+base["timestamp"].dt.minute
+            base=base.loc[
+                (mins>=9*60+15)&(mins<15*60+30)&(base["timestamp"].dt.dayofweek<5)
+            ].copy()
             if not base.empty:
-                base["timestamp"]=pd.to_datetime(base["timestamp"],utc=True).dt.tz_convert(IST)
-                base=base[base["timestamp"].dt.date == session_date].copy()
+                session_dates=self._session_dates(base)
+                # Prefer today's session when present; otherwise use the latest
+                # actual session returned by the provider.
+                session_date=today if today in session_dates else max(session_dates)
+                base=base.loc[base["timestamp"].dt.date==session_date].copy()
+                if interval == "1d":
+                    # This branch is intentionally kept for completeness; the
+                    # dedicated daily_view() always supplies the previous
+                    # completed daily session.
+                    daily=self.upstox.get_daily_history(
+                        instrument.instrument_key,max(30,settings.train_days_long)
+                    )
+                    if not daily.empty:
+                        daily["timestamp"]=pd.to_datetime(daily["timestamp"],utc=True).dt.tz_convert(IST)
+                        daily=daily[daily["timestamp"].dt.date < today].tail(settings.chart_bars)
+                        if not daily.empty:
+                            self._live_view_cache[cache_key]=(time.time(),daily.copy())
+                            return daily.copy()
                 aggregated=self.upstox.aggregate_minutes(base,int(interval))
                 if not aggregated.empty:
                     self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
-                    return aggregated
-        except Exception:
-            pass
+                    return aggregated.copy()
 
         return cached[1].copy() if cached else pd.DataFrame()
 
@@ -192,6 +241,8 @@ class AnalysisEngine:
         return combined,live
 
     def analyze(self,instrument:Instrument,interval:int,force_retrain:bool=False):
+        if not self._market_open():
+            raise ValueError("Prediction is available only while the Indian cash market is open (09:15–15:30 IST).")
         if int(interval) not in {1,5,10,15,30,60}:
             raise ValueError("Prediction is available for 1m, 5m, 10m, 15m, 30m and 60m. The 1D option is a history view.")
         interval=int(interval)
@@ -274,8 +325,26 @@ class AnalysisEngine:
             return {k:v for k,v in result.items() if k!="_created_at"}
 
     def daily_view(self, instrument: Instrument):
-        bars=self._live_snapshot(instrument,"1d",ttl_seconds=settings.live_rest_cache_seconds)
         now=datetime.now(ZoneInfo(IST))
+        cache_key=(instrument.instrument_key,"1d")
+        bars=pd.DataFrame()
+        cached=self._live_view_cache.get(cache_key)
+        if cached and time.time()-cached[0] < settings.live_rest_cache_seconds:
+            bars=cached[1].copy()
+        else:
+            try:
+                daily=self.upstox.get_daily_history(
+                    instrument.instrument_key,max(30,settings.train_days_long)
+                )
+                if not daily.empty:
+                    daily["timestamp"]=pd.to_datetime(daily["timestamp"],utc=True).dt.tz_convert(IST)
+                    # 1D is explicitly the previous-session/history view:
+                    # never substitute today's intraday session for this mode.
+                    daily=daily[daily["timestamp"].dt.date < now.date()].tail(settings.chart_bars)
+                    bars=daily.copy()
+                    self._live_view_cache[cache_key]=(time.time(),bars.copy())
+            except Exception:
+                bars=pd.DataFrame()
         rows=[]
         if not bars.empty:
             for r in bars.tail(settings.chart_bars).itertuples():

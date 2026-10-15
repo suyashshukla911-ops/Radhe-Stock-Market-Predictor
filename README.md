@@ -19,8 +19,10 @@ A stability-first Indian market analytics application centered on Upstox V3 live
 - FreeNewsApi / X refresh: **30 minutes**.
 - Times of India category scraper: **10 minutes**.
 - Upstox WebSocket: server-side continuous stream; browser polling is deliberately decoupled.
-- When the cash market is closed, the application shows the **last real market price and last real completed candle** rather than inventing an after-hours candle.
-- BUY/SELL is never forced. The prediction, range and EOD scenario remain visible even when the statistical gate says `REVALIDATE`.
+- When the cash market is closed, the application shows the **last real market price and the final completed intraday candle from the most recent real cash session** (today when today's session data is available). It never invents an after-hours candle.
+- The `1D` selector is a dedicated **previous-session history view**; it does not act as an intraday prediction mode.
+- Next-candle close/high/low and prediction probability are shown **only while the cash market is open**. After close, the UI shows the actual last-candle close/high/low instead.
+- BUY/SELL is never forced. The prediction and validation state remain visible during market hours even when the statistical gate says `REVALIDATE`.
 
 ## Data architecture
 

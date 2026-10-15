@@ -22,7 +22,7 @@ The WebSocket uses the trade timestamp (`ltt`). A websocket `currentTs` heartbea
 
 When the WebSocket is unavailable, the application uses V3 intraday candle data as a recovery path, cached for one minute.
 
-After 15:30 IST, the frontend shows the last actual market price and last completed candle. It does not create a 15:30–16:30 or 16:00–16:15 fake candle.
+After 15:30 IST, intraday views show the final actual cash-session candle for the latest session with data (today when today's session has been published by Upstox). The `1D` view remains a previous-session history view. The application never creates a 15:30–16:30 or 16:00–16:15 fake candle.
 
 ## 3. Historical training
 
