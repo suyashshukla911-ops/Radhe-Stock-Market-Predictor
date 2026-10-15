@@ -8,60 +8,97 @@
 </head>
 <body>
 <header class="topbar">
-  <div><div class="brand">RADHE STOCK MARKET PREDICTOR</div><div class="sub">Live Upstox feed · intraday ML · real-time re-pricing</div></div>
-  <div class="top-actions"><span id="status" class="status">Connecting…</span></div>
+  <div>
+    <div class="brand">RADHE STOCK MARKET PREDICTOR</div>
+    <div class="sub">Upstox live market data · intraday ML · TOI + news context</div>
+  </div>
+  <div id="status" class="status">CONNECTING…</div>
 </header>
+
 <main class="shell">
   <section class="hero">
     <div class="hero-main">
       <div class="eyebrow">LIVE MARKET ENGINE</div>
-      <h1>Trade the market that is actually moving — not yesterday’s chart.</h1>
-      <p>Upstox WebSocket ticks drive the live candle. The prediction is recalculated from the current market state instead of reusing an end-of-day dataset.</p>
+      <h1>Stable market intelligence built from the market that is actually moving.</h1>
+      <p>Upstox WebSocket remains the live source. The browser refreshes once per minute, prediction refreshes every five minutes, the model retrains every thirty minutes, TOI refreshes every ten minutes, and slower news sources refresh every thirty minutes.</p>
       <div class="market-strip">
-        <span class="live-dot"></span><b id="feed-age">—</b><span>data age</span>
-        <span class="divider"></span><b id="candle-clock">—</b><span>current candle</span>
+        <span id="market-dot" class="live-dot"></span><b id="feed-age">—</b><span>data age</span>
+        <span class="divider"></span><b id="candle-clock">—</b><span>candle</span>
       </div>
     </div>
     <div class="hero-side">
       <div class="small-label">SAFETY GATE</div>
       <strong id="gate-title">REVALIDATE</strong>
-      <span id="gate-copy">A BUY/SELL is shown only when selective-signal validation clears the configured quality gate.</span>
-      <span class="fine">Analytics only. No order placement is included.</span>
+      <span id="gate-copy">Predictions remain visible; BUY/SELL is only eligible after the validation gate clears a sufficient sample.</span>
+      <span class="fine">Paper-analysis only. No orders are placed by this application.</span>
     </div>
   </section>
 
   <section class="control-card">
-    <div class="field search"><label>Instrument</label><input id="symbol" list="priority-list" value="SENSEX" placeholder="SENSEX, NIFTY 50, HDFCBANK…"><datalist id="priority-list"></datalist></div>
-    <div class="field small"><label>Timeframe</label><select id="interval"><option value="1">1m</option><option value="5" selected>5m</option><option value="10">10m</option><option value="15">15m</option><option value="30">30m</option><option value="60">60m</option></select></div>
-    <button id="analyze" class="btn primary">START LIVE</button><button id="retrain" class="btn ghost">RETRAIN MODEL</button>
+    <div class="field search">
+      <label>Instrument</label>
+      <input id="symbol" list="priority-list" value="SENSEX" placeholder="SENSEX, NIFTY 50, HDFCBANK…">
+      <datalist id="priority-list"></datalist>
+      <div id="search-hint" class="hint">Upstox exchange directory is searchable; inaccessible securities remain visible in the directory.</div>
+    </div>
+    <div class="field small"><label>Timeframe</label>
+      <select id="interval"><option value="1">1m</option><option value="5" selected>5m</option><option value="10">10m</option><option value="15">15m</option><option value="30">30m</option><option value="60">60m</option></select>
+    </div>
+    <button id="analyze" class="btn primary">ANALYZE</button>
+    <button id="retrain" class="btn ghost">RETRAIN MODEL</button>
   </section>
 
-  <section class="live-panel">
-    <div class="live-price"><span class="small-label">LIVE PRICE</span><strong id="current">—</strong><span id="timestamp">—</span></div>
-    <div class="metric"><span>NEXT CLOSE</span><strong id="next-close">—</strong></div>
-    <div class="metric"><span>NEXT HIGH</span><strong id="next-high">—</strong></div>
-    <div class="metric"><span>NEXT LOW</span><strong id="next-low">—</strong></div>
-    <div class="metric"><span>EOD SCENARIO</span><strong id="eod-close">—</strong></div>
-    <div class="metric signal"><span>ACTION</span><strong id="signal">—</strong></div>
+  <section class="market-state">
+    <div class="metric primary-metric"><span id="price-label">LAST / LIVE PRICE</span><strong id="current">—</strong><small id="timestamp">—</small></div>
+    <div class="metric"><span>NEXT CLOSE</span><strong id="next-close">—</strong><small id="next-close-label">selected timeframe</small></div>
+    <div class="metric"><span>NEXT HIGH</span><strong id="next-high">—</strong><small>selected timeframe</small></div>
+    <div class="metric"><span>NEXT LOW</span><strong id="next-low">—</strong><small>selected timeframe</small></div>
+    <div class="metric"><span>END-OF-DAY</span><strong id="eod-close">—</strong><small>today's session scenario</small></div>
+    <div class="metric signal"><span>ACTION</span><strong id="signal">—</strong><small id="signal-note">—</small></div>
   </section>
 
   <section class="grid">
-    <div class="panel chart-panel"><div class="panel-head"><div><h2 id="title">SENSEX · 5m</h2><span id="candle-label" class="muted">—</span></div><div id="probability" class="pill">UP —</div></div><div id="chart"></div></div>
+    <div class="panel chart-panel">
+      <div class="panel-head">
+        <div><h2 id="title">SENSEX · 5m</h2><span id="candle-label" class="muted">—</span></div>
+        <div id="probability" class="pill">UP —</div>
+      </div>
+      <div id="chart"></div>
+    </div>
     <div class="panel side-panel">
       <div class="section-title">Prediction</div>
       <div class="prediction-box"><span>Up probability</span><b id="up-p">—</b><small id="down-p">—</small></div>
       <div class="prediction-box"><span>Model status</span><b id="model-status">—</b><small id="model-age">—</small></div>
       <div class="section-title space">Validation</div>
       <div id="validation" class="validation"></div>
+      <div class="policy-box" id="policy-box">—</div>
     </div>
   </section>
 
   <section class="grid lower">
-    <div class="panel"><div class="panel-head"><div><h2>News impact</h2><span class="muted">FreeNewsApi · market-aware refresh</span></div><div id="news-score" class="pill">Impact —</div></div><div id="news-summary" class="news-summary"></div><div id="news-list" class="news-list"></div><div class="quota" id="news-quota">News quota: —</div></div>
-    <div class="panel"><div class="panel-head"><div><h2>India market pulse</h2><span class="muted">Live quote universe</span></div><button id="pulse" class="btn ghost">REFRESH</button></div><div id="pulse-grid" class="pulse-grid"></div></div>
+    <div class="panel">
+      <div class="panel-head"><div><h2>Top market news</h2><span class="muted">TOI + FreeNewsApi + optional X/Twitter context</span></div><div id="news-score" class="pill">Impact —</div></div>
+      <div id="news-summary" class="news-summary"></div>
+      <div id="news-list" class="news-list"></div>
+      <div class="quota" id="news-quota">News status: —</div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><div><h2>India market pulse</h2><span class="muted">Selected liquid / priority names</span></div><button id="pulse" class="btn ghost">REFRESH</button></div>
+      <div id="pulse-grid" class="pulse-grid"></div>
+    </div>
   </section>
 
-  <footer><span>Market data: Upstox V3 + WebSocket. News: FreeNewsApi.</span><span>Live price/candle refresh: 1s UI · model/news recalculation: configured cadence · no profit guarantee.</span></footer>
+  <section class="panel universe-panel">
+    <div class="panel-head"><div><h2>Indian equity directory</h2><span class="muted">Complete Upstox equity directory remains searchable even when quotes/history are unavailable.</span></div><div id="universe-badge" class="pill">DIRECTORY —</div></div>
+    <div class="universe-controls"><input id="universe-search" placeholder="Search symbol or company"><button id="universe-search-btn" class="btn ghost">SEARCH</button></div>
+    <div id="universe-results" class="universe-results"></div>
+  </section>
+
+  <footer>
+    <span>Market data: Upstox V3 + server WebSocket · News: TOI scraper + FreeNewsApi + optional X.</span>
+    <span>UI refresh: 60s · prediction: 5m · model retrain: 30m · TOI: 10m · news APIs: 30m.</span>
+  </footer>
 </main>
 <script src="/static/app.js"></script>
-</body></html>
+</body>
+</html>

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
+import io
 import json
-import time
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -20,7 +22,7 @@ from app.config import INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN
 
 try:
     import upstox_client
-except Exception:  # optional until installed
+except Exception:
     upstox_client = None
 
 UPSTOX_API = "https://api.upstox.com"
@@ -28,7 +30,6 @@ INSTRUMENT_URLS = {
     "NSE": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
     "BSE": "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz",
 }
-
 
 @dataclass
 class Instrument:
@@ -41,25 +42,27 @@ class Instrument:
     short_name: str
     isin: str = ""
 
-
 class UpstoxError(RuntimeError):
     pass
-
 
 class UpstoxClient:
     def __init__(self, access_token: str = "", cache_dir: str = "data_cache"):
         self.access_token = access_token.strip()
         self.session = requests.Session()
-        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=Retry(total=2, backoff_factor=0.15, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset({"GET"})))
+        retry = Retry(
+            total=3, connect=3, read=3, backoff_factor=0.25,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retry)
         self.session.mount("https://", adapter)
-        self.session.headers.update({
-            "Accept": "application/json",
-            "User-Agent": "RadheStockMarketPredictor/2.0",
-        })
+        self.session.headers.update({"Accept": "application/json", "User-Agent": "RadheStockMarketPredictor/3.0"})
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._instruments: list[Instrument] | None = None
         self._lock = threading.RLock()
+        self._rest_cache: dict[str, tuple[float, object]] = {}
 
     @property
     def connected(self) -> bool:
@@ -68,215 +71,221 @@ class UpstoxClient:
     def set_access_token(self, token: str) -> None:
         self.access_token = token.strip()
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self):
         if not self.access_token:
-            raise UpstoxError("Upstox is not connected. Set UPSTOX_ACCESS_TOKEN in the environment.")
+            raise UpstoxError("Upstox access token is missing.")
         return {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
 
-    def _get_json(self, url: str, params: Optional[dict] = None) -> dict:
+    def _get_json(self, url: str, params: Optional[dict] = None):
         try:
-            response = self.session.get(url, headers=self._headers(), params=params, timeout=25)
+            r = self.session.get(url, headers=self._headers(), params=params, timeout=25)
         except requests.RequestException as exc:
             raise UpstoxError(f"Upstox request failed: {exc}") from exc
-        if response.status_code >= 400:
-            raise UpstoxError(f"Upstox HTTP {response.status_code}: {response.text[:500]}")
+        if r.status_code >= 400:
+            raise UpstoxError(f"Upstox HTTP {r.status_code}: {r.text[:400]}")
         try:
-            return response.json()
+            return r.json()
         except Exception as exc:
-            raise UpstoxError("Upstox returned a non-JSON response.") from exc
+            raise UpstoxError("Upstox returned non-JSON data.") from exc
 
-    # ---------- Instruments ----------
-
+    # ---------- instrument directory ----------
     def _download_instruments(self) -> list[Instrument]:
-        import gzip
-        import io
         rows: list[Instrument] = []
         for exchange, url in INSTRUMENT_URLS.items():
             try:
-                response = self.session.get(url, timeout=60)
-                response.raise_for_status()
-            except requests.RequestException as exc:
+                r = self.session.get(url, timeout=60)
+                r.raise_for_status()
+                with gzip.GzipFile(fileobj=io.BytesIO(r.content)) as gz:
+                    payload = json.loads(gz.read().decode("utf-8"))
+            except Exception as exc:
                 raise UpstoxError(f"Instrument master download failed for {exchange}: {exc}") from exc
-            with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as gz:
-                payload = json.loads(gz.read().decode("utf-8"))
+
             for item in payload:
-                if item.get("segment") not in {"NSE_EQ", "BSE_EQ"}:
+                segment = str(item.get("segment", ""))
+                if segment not in {"NSE_EQ", "BSE_EQ"}:
                     continue
                 instrument_type = str(item.get("instrument_type", "")).upper()
                 if instrument_type not in {"EQ", "BE", "BZ", "ST", "SM"}:
                     continue
+                key = str(item.get("instrument_key", ""))
+                symbol = str(item.get("trading_symbol", ""))
+                if not key or not symbol:
+                    continue
                 rows.append(Instrument(
-                    instrument_key=item.get("instrument_key", ""),
-                    exchange=item.get("exchange", exchange),
-                    segment=item.get("segment", ""),
+                    instrument_key=key,
+                    exchange=str(item.get("exchange", exchange)),
+                    segment=segment,
                     instrument_type=instrument_type,
-                    name=item.get("name", "") or "",
-                    trading_symbol=item.get("trading_symbol", "") or "",
-                    short_name=item.get("short_name", "") or "",
-                    isin=item.get("isin", "") or "",
+                    name=str(item.get("name", "")),
+                    trading_symbol=symbol,
+                    short_name=str(item.get("short_name", "")),
+                    isin=str(item.get("isin", "")),
                 ))
-        return [r for r in rows if r.instrument_key and r.trading_symbol]
+        # Stable, de-duplicated universe. This keeps unavailable securities visible.
+        unique = {}
+        for item in rows:
+            unique[item.instrument_key] = item
+        return list(unique.values())
 
     def load_instruments(self, force: bool = False) -> list[Instrument]:
         cache_file = self.cache_dir / "instruments_equity.json"
         with self._lock:
-            if not force and cache_file.exists():
-                age = time.time() - cache_file.stat().st_mtime
-                if age < 20 * 3600:
-                    try:
-                        raw = json.loads(cache_file.read_text(encoding="utf-8"))
-                        self._instruments = [Instrument(**x) for x in raw]
-                        return self._instruments
-                    except Exception:
-                        pass
+            if not force and cache_file.exists() and time.time() - cache_file.stat().st_mtime < 12 * 3600:
+                try:
+                    raw = json.loads(cache_file.read_text(encoding="utf-8"))
+                    self._instruments = [Instrument(**x) for x in raw]
+                    return self._instruments
+                except Exception:
+                    pass
             rows = self._download_instruments()
-            cache_file.write_text(json.dumps([r.__dict__ for r in rows], ensure_ascii=False), encoding="utf-8")
+            cache_file.write_text(json.dumps([x.__dict__ for x in rows], ensure_ascii=False), encoding="utf-8")
             self._instruments = rows
             return rows
 
-    def resolve_symbol(self, symbol_or_name: str) -> Instrument:
-        raw = symbol_or_name.strip()
+    def resolve_symbol(self, query: str) -> Instrument:
+        raw = query.strip()
         q = raw.upper()
-        for aliases, key in [
-            (["SENSEX", "BSE SENSEX"], "SENSEX"),
-            (["NIFTY 50", "NIFTY", "NSE NIFTY"], "NIFTY 50"),
-            (["NIFTY BANK", "BANKNIFTY", "NIFTYBANK"], "NIFTY BANK"),
-            (["INDIA VIX", "VIX"], "INDIA VIX"),
-        ]:
-            if q in {a.upper() for a in aliases}:
-                item = INDEX_INSTRUMENTS[key]
-                return Instrument(instrument_type="INDEX", isin="", **item)
-
+        aliases = {
+            "SENSEX": "SENSEX", "BSE SENSEX": "SENSEX",
+            "NIFTY 50": "NIFTY 50", "NIFTY": "NIFTY 50", "NSE NIFTY": "NIFTY 50",
+            "NIFTY BANK": "NIFTY BANK", "BANKNIFTY": "NIFTY BANK", "NIFTYBANK": "NIFTY BANK",
+            "INDIA VIX": "INDIA VIX", "VIX": "INDIA VIX",
+        }
+        if q in aliases:
+            item = INDEX_INSTRUMENTS[aliases[q]]
+            return Instrument(instrument_type="INDEX", isin="", **item)
         matches = self.search_instruments(raw, limit=25)
         if not matches:
-            raise UpstoxError(f"Indian instrument not found in the Upstox universe: {symbol_or_name}")
+            raise UpstoxError(f"Instrument not found: {query}")
         return matches[0]
 
-    def search_instruments(self, query: str, limit: int = 25) -> list[Instrument]:
+    def search_instruments(self, query: str, limit: int = 50) -> list[Instrument]:
         q = query.strip().upper()
         if not q:
             return []
-        items = self.load_instruments()
-        exact: list[Instrument] = []
-        fuzzy: list[Instrument] = []
-        for ins in items:
+        exact, fuzzy = [], []
+        for ins in self.load_instruments():
             fields = [ins.trading_symbol.upper(), ins.name.upper(), ins.short_name.upper(), ins.isin.upper()]
             if q == ins.trading_symbol.upper():
                 exact.append(ins)
             elif any(q in field for field in fields):
                 fuzzy.append(ins)
-        ordered = exact + fuzzy
-        ordered.sort(key=lambda x: (0 if x.exchange == "NSE" else 1, x.trading_symbol))
-        return ordered[:limit]
+        exact.sort(key=lambda x: (x.exchange, x.trading_symbol))
+        fuzzy.sort(key=lambda x: (0 if x.exchange == "NSE" else 1, x.trading_symbol))
+        return (exact + fuzzy)[:limit]
 
-    # ---------- Market data ----------
+    def universe_summary(self):
+        items = self.load_instruments()
+        return {
+            "total": len(items),
+            "nse": sum(x.exchange == "NSE" for x in items),
+            "bse": sum(x.exchange == "BSE" for x in items),
+            "results": [
+                {"symbol": x.trading_symbol, "name": x.name, "exchange": x.exchange, "segment": x.segment, "instrument_key": x.instrument_key}
+                for x in items
+            ],
+        }
 
+    # ---------- candles ----------
     @staticmethod
     def _to_df(candles: list) -> pd.DataFrame:
-        columns = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
+        cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
         if not candles:
-            return pd.DataFrame(columns=columns)
-        df = pd.DataFrame(candles, columns=columns[:len(candles[0])])
-        for c in ["open", "high", "low", "close", "volume", "oi"]:
+            return pd.DataFrame(columns=cols)
+        df = pd.DataFrame(candles, columns=cols[:len(candles[0])])
+        for c in cols[1:]:
             if c in df:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(IST)
         return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
     @staticmethod
-    def _aggregate_minutes(df: pd.DataFrame, interval: int) -> pd.DataFrame:
-        if df.empty or interval <= 1:
+    def aggregate_minutes(df: pd.DataFrame, interval: int) -> pd.DataFrame:
+        if df.empty:
             return df.copy()
         data = df.copy().sort_values("timestamp")
+        for c in ["open","high","low","close","volume"]:
+            data[c] = pd.to_numeric(data[c], errors="coerce")
         ts = pd.to_datetime(data["timestamp"], utc=False).dt.tz_convert(IST)
         mins = ts.dt.hour * 60 + ts.dt.minute
-        # Indian cash-market session: 09:15 through 15:30 IST. Ignore auction/after-close noise.
-        keep = (mins >= MARKET_OPEN_MINUTES) & (mins < MARKET_CLOSE_MINUTES)
-        data = data.loc[keep].copy()
+        mask = (mins >= MARKET_OPEN_MINUTES) & (mins < MARKET_CLOSE_MINUTES) & (ts.dt.dayofweek < 5)
+        data = data.loc[mask].copy()
         if data.empty:
-            return data
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
         ts = pd.to_datetime(data["timestamp"], utc=False).dt.tz_convert(IST)
         session_open = ts.dt.normalize() + pd.Timedelta(minutes=MARKET_OPEN_MINUTES)
-        delta = ((ts - session_open).dt.total_seconds() // 60).astype(int)
-        data["bucket"] = session_open + pd.to_timedelta((delta // int(interval)) * int(interval), unit="m")
-        grouped = data.groupby("bucket", sort=True)
-        out = grouped.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum")).reset_index().rename(columns={"bucket":"timestamp"})
+        elapsed = ((ts - session_open).dt.total_seconds() // 60).astype(int)
+        bucket = (elapsed // max(1, int(interval))) * max(1, int(interval))
+        data["timestamp"] = session_open + pd.to_timedelta(bucket, unit="m")
+        out = data.groupby("timestamp", sort=True).agg(
+            open=("open","first"), high=("high","max"), low=("low","min"),
+            close=("close","last"), volume=("volume","sum")
+        ).reset_index()
         out["oi"] = 0.0
-        return out[["timestamp","open","high","low","close","volume","oi"]]
+        return out[["timestamp","open","high","low","close","volume","oi"]].drop_duplicates("timestamp")
 
     def get_intraday(self, instrument_key: str, interval: int) -> pd.DataFrame:
+        # For robustness, use 1-minute source data and aggregate locally for all
+        # requested timeframes. This also gives deterministic 09:15 anchored bars.
+        base = self._get_intraday_1m(instrument_key)
+        return self.aggregate_minutes(base, interval)
+
+    def _get_intraday_1m(self, instrument_key: str) -> pd.DataFrame:
         encoded = quote(instrument_key, safe="")
-        try:
-            url = f"{UPSTOX_API}/v3/historical-candle/intraday/{encoded}/minutes/{int(interval)}"
-            payload = self._get_json(url)
-            df = self._to_df(payload.get("data", {}).get("candles", []))
-        except UpstoxError:
-            df = pd.DataFrame()
-        if not df.empty:
-            return self._aggregate_minutes(df, interval)
-        if interval != 1:
-            # V3 supports custom intervals, but a 1-minute fallback is more resilient for indices.
-            url = f"{UPSTOX_API}/v3/historical-candle/intraday/{encoded}/minutes/1"
-            payload = self._get_json(url)
-            base = self._to_df(payload.get("data", {}).get("candles", []))
-            return self._aggregate_minutes(base, interval)
-        return df
+        url = f"{UPSTOX_API}/v3/historical-candle/intraday/{encoded}/minutes/1"
+        payload = self._get_json(url)
+        return self._to_df(payload.get("data", {}).get("candles", []))
 
     def get_historical(self, instrument_key: str, interval: int, from_date: date, to_date: date) -> pd.DataFrame:
-        # V3 allows a maximum of one month for 1-15 minute candles and one quarter for larger minute intervals.
-        if interval <= 15:
-            max_days = 30
-        else:
-            max_days = 92
+        # V3 minute data is limited to one month for intervals through 15m and
+        # one quarter for larger minute intervals. We chunk conservatively.
+        max_days = 30 if interval <= 15 else 92
         frames = []
         current_to = to_date
+        encoded = quote(instrument_key, safe="")
         while current_to >= from_date:
             current_from = max(from_date, current_to - timedelta(days=max_days - 1))
-            encoded = quote(instrument_key, safe="")
             url = f"{UPSTOX_API}/v3/historical-candle/{encoded}/minutes/{int(interval)}/{current_to.isoformat()}/{current_from.isoformat()}"
-            payload = self._get_json(url)
+            try:
+                payload = self._get_json(url)
+            except UpstoxError:
+                if current_from == from_date:
+                    raise
+                current_to = current_from - timedelta(days=1)
+                continue
             frames.append(self._to_df(payload.get("data", {}).get("candles", [])))
             if current_from <= from_date:
                 break
             current_to = current_from - timedelta(days=1)
         if not frames:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
         return pd.concat(frames, ignore_index=True).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
     def get_recent_history(self, instrument_key: str, interval: int, calendar_days: int) -> pd.DataFrame:
         now = datetime.now(ZoneInfo(IST))
         to_date = now.date()
         from_date = to_date - timedelta(days=calendar_days)
-        try:
-            direct = self.get_historical(instrument_key, interval, from_date, to_date)
-        except UpstoxError:
-            direct = pd.DataFrame()
-        if not direct.empty:
-            return self._aggregate_minutes(direct, interval)
+        # Always train intraday models from 1-minute source data. The V3 API
+        # permits one-month 1m slices, so 30/90-day windows are chunked.
         if interval != 1:
-            # Fallback to 1-minute history and build the requested timeframe locally.
             base = self.get_historical(instrument_key, 1, from_date, to_date)
-            return self._aggregate_minutes(base, interval)
-        return direct
+            return self.aggregate_minutes(base, interval)
+        return self.get_historical(instrument_key, 1, from_date, to_date)
 
     def get_quote_batch(self, instrument_keys: Iterable[str]) -> dict:
         keys = list(dict.fromkeys(instrument_keys))
-        if not keys:
-            return {}
-        data: dict = {}
-        for start in range(0, len(keys), 500):
-            batch = keys[start:start + 500]
+        out = {}
+        for i in range(0, len(keys), 500):
+            batch = keys[i:i+500]
             payload = self._get_json(f"{UPSTOX_API}/v3/market-quote/quotes", params={"instrument_key": ",".join(batch)})
-            data.update(payload.get("data", {}))
-        return data
-
+            out.update(payload.get("data", {}))
+        return out
 
 class LiveMarketHub:
-    """Server-side Upstox V3 feed with a rolling 1-minute bar store.
+    """Low-frequency browser polling + continuous server-side WebSocket.
 
-    The access token stays server-side. The V3 WebSocket is the primary live source;
-    its full feed includes LTPC plus 1-minute/30-minute OHLC snapshots. Tick data is
-    also folded into the current 1-minute bar so the forming candle moves immediately.
+    The WebSocket is the live data source. Browser polling is intentionally
+    decoupled from the stream so the server does not hammer Upstox every second.
     """
 
     def __init__(self, upstox: UpstoxClient):
@@ -288,52 +297,48 @@ class LiveMarketHub:
         self._requested: set[str] = set()
         self._minutes: dict[str, deque[dict]] = {}
         self._current: dict[str, dict] = {}
-        self._latest: dict[str, dict] = {}
+        self._latest_session: dict[str, dict] = {}
         self._last_error = ""
         self._worker = None
 
     @property
-    def connected(self) -> bool:
-        with self._lock:
-            return self._connected
+    def connected(self): 
+        with self._lock: return self._connected
 
     @property
-    def last_error(self) -> str:
-        with self._lock:
-            return self._last_error
+    def last_error(self):
+        with self._lock: return self._last_error
 
-    def start(self) -> None:
+    def start(self):
         if self._started or not self.upstox.access_token or upstox_client is None:
             return
         self._started = True
         self._worker = threading.Thread(target=self._run, name="upstox-stream", daemon=True)
         self._worker.start()
 
-    def subscribe(self, instrument_keys: Iterable[str]) -> None:
-        keys = {k for k in instrument_keys if k}
-        if not keys:
-            return
+    def subscribe(self, instrument_keys: Iterable[str]):
+        keys = {x for x in instrument_keys if x}
+        if not keys: return
         self.start()
         with self._lock:
             new_keys = keys - self._requested
             self._requested.update(keys)
-            if self._streamer is not None and self._connected and new_keys:
-                try:
-                    self._streamer.subscribe(sorted(new_keys), "full")
-                except Exception as exc:
-                    self._last_error = str(exc)
+            streamer = self._streamer
+            connected = self._connected
+        if streamer is not None and connected and new_keys:
+            try: streamer.subscribe(sorted(new_keys), "full")
+            except Exception as exc:
+                with self._lock: self._last_error = str(exc)
 
-    def _run(self) -> None:
+    def _run(self):
         while True:
             try:
                 configuration = upstox_client.Configuration()
                 configuration.access_token = self.upstox.access_token
                 client = upstox_client.ApiClient(configuration)
                 streamer = upstox_client.MarketDataStreamerV3(client)
-                try:
-                    streamer.auto_reconnect(True, 5, 100)
-                except Exception:
-                    pass
+                try: streamer.auto_reconnect(True, 5, 60)
+                except Exception: pass
                 self._streamer = streamer
 
                 def on_open():
@@ -342,15 +347,12 @@ class LiveMarketHub:
                         self._last_error = ""
                         keys = sorted(self._requested)
                     if keys:
-                        try:
-                            streamer.subscribe(keys, "full")
+                        try: streamer.subscribe(keys, "full")
                         except Exception as exc:
-                            with self._lock:
-                                self._last_error = str(exc)
+                            with self._lock: self._last_error = str(exc)
 
                 def on_close():
-                    with self._lock:
-                        self._connected = False
+                    with self._lock: self._connected = False
 
                 def on_error(err):
                     with self._lock:
@@ -358,11 +360,9 @@ class LiveMarketHub:
                         self._last_error = str(err)
 
                 def on_message(message):
-                    try:
-                        self._ingest(message)
+                    try: self._ingest(message)
                     except Exception as exc:
-                        with self._lock:
-                            self._last_error = f"feed parse: {exc}"
+                        with self._lock: self._last_error = f"feed parse: {exc}"
 
                 streamer.on("open", on_open)
                 streamer.on("close", on_close)
@@ -375,160 +375,92 @@ class LiveMarketHub:
                     self._connected = False
                     self._last_error = str(exc)
                 time.sleep(10)
-    @staticmethod
-    def _as_float(value):
-        try:
-            return float(value)
-        except Exception:
-            return None
 
     @staticmethod
-    def _as_epoch_ms(value):
-        try:
-            return int(float(value))
-        except Exception:
-            return None
+    def _float(v):
+        try: return float(v)
+        except Exception: return None
 
-    def _upsert_minute_bar(self, key: str, bar: dict) -> None:
-        """Merge a websocket OHLC snapshot or tick into the local 1-minute store."""
+    @staticmethod
+    def _epoch_ms(v):
+        try: return int(float(v))
+        except Exception: return None
+
+    def _upsert(self, key: str, bar: dict):
         ts = pd.Timestamp(bar["timestamp"])
-        if ts.tz is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
+        if ts.tz is None: ts = ts.tz_localize(IST)
+        else: ts = ts.tz_convert(IST)
         ts = ts.floor("min")
-        row = {
-            "timestamp": ts.to_pydatetime(),
-            "open": float(bar["open"]),
-            "high": float(bar["high"]),
-            "low": float(bar["low"]),
-            "close": float(bar["close"]),
-            "volume": float(bar.get("volume") or 0.0),
-        }
+        row = {"timestamp": ts.to_pydatetime(), "open": float(bar["open"]), "high": float(bar["high"]),
+               "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar.get("volume") or 0.0)}
         with self._lock:
             current = self._current.get(key)
             if current is None or current["timestamp"] != row["timestamp"]:
                 if current is not None:
-                    self._minutes.setdefault(key, deque(maxlen=4000)).append(dict(current))
+                    self._minutes.setdefault(key, deque(maxlen=8000)).append(dict(current))
                 self._current[key] = row
                 return
-            # Snapshot OHLC is authoritative for the current minute; merge later ticks.
-            current["open"] = float(current.get("open", row["open"]))
-            current["high"] = max(float(current.get("high", row["high"])), row["high"])
-            current["low"] = min(float(current.get("low", row["low"])), row["low"])
+            current["open"] = float(current["open"])
+            current["high"] = max(float(current["high"]), row["high"])
+            current["low"] = min(float(current["low"]), row["low"])
             current["close"] = row["close"]
-            if row.get("volume") is not None:
-                current["volume"] = max(float(current.get("volume", 0.0)), float(row["volume"]))
+            current["volume"] = max(float(current.get("volume", 0.0)), row["volume"])
 
-    def _extract_full_feed(self, feed: dict) -> dict:
-        # SDK versions/documentation use both fullFeed and ff.
-        full = feed.get("fullFeed") or feed.get("ff") or {}
-        ff = full.get("marketFF") or full.get("indexFF") or {}
-        return ff if isinstance(ff, dict) else {}
-
-    def _ingest(self, message: dict) -> None:
-        if not isinstance(message, dict):
-            return
+    def _ingest(self, message: dict):
+        if not isinstance(message, dict): return
         feeds = message.get("feeds") or {}
         for key, feed in feeds.items():
-            if not isinstance(feed, dict):
+            if not isinstance(feed, dict): continue
+            full = feed.get("fullFeed") or feed.get("ff") or {}
+            ff = full.get("marketFF") or full.get("indexFF") or {}
+            if not isinstance(ff, dict): ff = {}
+            ltpc = ff.get("ltpc") or feed.get("ltpc") or {}
+            ltp = self._float(ltpc.get("ltp"))
+            # IMPORTANT: ltt is trade time; currentTs can be a heartbeat time.
+            ltt = self._epoch_ms(ltpc.get("ltt"))
+            cp = self._float(ltpc.get("cp"))
+            if ltp is None or ltt is None:
                 continue
-            direct = feed.get("ltpc") or {}
-            ff = self._extract_full_feed(feed)
-            ff_ltpc = ff.get("ltpc") or {}
-            ltpc = ff_ltpc or direct
-            ltp = self._as_float(ltpc.get("ltp"))
-            ltt = self._as_epoch_ms(ltpc.get("ltt") or message.get("currentTs"))
-            cp = self._as_float(ltpc.get("cp"))
-            ltq = self._as_float(ltpc.get("ltq"))
-            if ltp is None:
+            trade_ts = datetime.fromtimestamp(ltt/1000, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST))
+            now = datetime.now(ZoneInfo(IST))
+            minute = trade_ts.hour*60 + trade_ts.minute
+            if trade_ts.weekday() >= 5 or minute < MARKET_OPEN_MINUTES or minute >= MARKET_CLOSE_MINUTES:
+                # Never overwrite the last valid cash-session trade with a heartbeat.
                 continue
-            if ltt is None:
-                ltt = int(time.time() * 1000)
-            trade_ts = datetime.fromtimestamp(ltt / 1000.0, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST))
-            now_ist = datetime.now(ZoneInfo(IST))
-            if trade_ts.year < 2020:
-                return
-            minute_of_day = trade_ts.hour * 60 + trade_ts.minute
-            # Ignore heartbeats/late packets outside the NSE/BSE cash session when building candles.
-            if trade_ts.weekday() >= 5 or minute_of_day < MARKET_OPEN_MINUTES or minute_of_day >= MARKET_CLOSE_MINUTES:
-                with self._lock:
-                    self._latest[key] = {
-                        "price": ltp, "previous_close": cp, "trade_time": trade_ts.isoformat(),
-                        "updated_at": now_ist.isoformat(), "volume": self._as_float(ff.get("vtt")),
-                        "ltq": ltq, "instrument_key": key, "session_trade": False,
-                    }
-                return
-
-            # First consume the authoritative 1-minute OHLC snapshot if present.
             market_ohlc = ff.get("marketOHLC") or feed.get("marketOHLC") or {}
-            for candle in (market_ohlc.get("ohlc") or []):
+            for candle in market_ohlc.get("ohlc") or []:
                 if not isinstance(candle, dict) or candle.get("interval") != "I1":
                     continue
-                cts = self._as_epoch_ms(candle.get("ts"))
-                op = self._as_float(candle.get("open")); hi = self._as_float(candle.get("high"))
-                lo = self._as_float(candle.get("low")); cl = self._as_float(candle.get("close"))
-                if cts is None or op is None or hi is None or lo is None or cl is None:
-                    continue
-                self._upsert_minute_bar(key, {
-                    "timestamp": datetime.fromtimestamp(cts / 1000.0, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST)),
-                    "open": op, "high": hi, "low": lo, "close": cl,
-                    "volume": self._as_float(candle.get("vol")) or 0.0,
-                })
-
-            # Tick-level update makes the forming minute move immediately.
-            self._upsert_minute_bar(key, {
-                "timestamp": trade_ts,
-                "open": ltp,
-                "high": ltp,
-                "low": ltp,
-                "close": ltp,
-                "volume": self._as_float(ff.get("vtt")) or 0.0,
-            })
-
+                ts = self._epoch_ms(candle.get("ts"))
+                op = self._float(candle.get("open")); hi = self._float(candle.get("high"))
+                lo = self._float(candle.get("low")); cl = self._float(candle.get("close"))
+                if None in (ts, op, hi, lo, cl): continue
+                self._upsert(key, {"timestamp": datetime.fromtimestamp(ts/1000, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST)),
+                                    "open":op,"high":hi,"low":lo,"close":cl,"volume":self._float(candle.get("vol")) or 0.0})
+            self._upsert(key, {"timestamp":trade_ts,"open":ltp,"high":ltp,"low":ltp,"close":ltp,"volume":0.0})
             with self._lock:
-                self._latest[key] = {
-                    "price": ltp,
-                    "previous_close": cp,
-                    "trade_time": trade_ts.isoformat(),
-                    "updated_at": now_ist.isoformat(),
-                    "volume": self._as_float(ff.get("vtt")),
-                    "ltq": ltq,
-                    "instrument_key": key,
-                    "session_trade": True,
+                self._latest_session[key] = {
+                    "price": ltp, "previous_close": cp, "trade_time": trade_ts.isoformat(),
+                    "updated_at": now.isoformat(), "instrument_key": key, "session_trade": True,
                 }
 
-    def latest(self, instrument_key: str) -> dict | None:
+    def latest(self, key: str):
         with self._lock:
-            value = self._latest.get(instrument_key)
-            return dict(value) if value else None
+            return dict(self._latest_session[key]) if key in self._latest_session else None
 
-    def one_minute_bars(self, instrument_key: str) -> pd.DataFrame:
+    def live_bars(self, key: str, interval: int = 1):
         with self._lock:
-            rows = list(self._minutes.get(instrument_key, deque()))
-            current = self._current.get(instrument_key)
-            if current:
-                rows.append(dict(current))
-        if not rows:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-        return pd.DataFrame(rows).assign(oi=0.0).sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+            rows = list(self._minutes.get(key, ()))
+            current = self._current.get(key)
+            if current is not None: rows.append(dict(current))
+        if not rows: return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False).dt.tz_convert(IST)
+        df["oi"] = 0.0
+        if interval == 1: return df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+        return UpstoxClient.aggregate_minutes(df, interval)
 
-    def live_bars(self, instrument_key: str, interval: int) -> pd.DataFrame:
-        one = self.one_minute_bars(instrument_key)
-        if one.empty:
-            return one
-        one = one.copy()
-        ts = pd.to_datetime(one["timestamp"], utc=False).dt.tz_convert(IST)
-        mins = ts.dt.hour * 60 + ts.dt.minute
-        one = one.loc[(mins >= MARKET_OPEN_MINUTES) & (mins < MARKET_CLOSE_MINUTES)].copy()
-        if one.empty:
-            return one
-        ts = pd.to_datetime(one["timestamp"], utc=False).dt.tz_convert(IST)
-        session_open = ts.dt.normalize() + pd.Timedelta(minutes=MARKET_OPEN_MINUTES)
-        delta_min = ((ts - session_open).dt.total_seconds() // 60).astype(int)
-        one["bucket"] = session_open + pd.to_timedelta((delta_min // int(interval)) * int(interval), unit="m")
-        grouped = one.groupby("bucket", sort=True)
-        out = grouped.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum")).reset_index().rename(columns={"bucket":"timestamp"})
-        out["oi"] = 0.0
-        return out
-
+    def latest_or_rest(self, key: str, interval: int):
+        tick = self.latest(key)
+        bars = self.live_bars(key, interval)
+        return tick, bars

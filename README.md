@@ -1,64 +1,73 @@
 # Radhe Stock Market Predictor
 
-A live India-market analytics application built around Upstox V3 market data and a server-side WebSocket stream. It is intentionally focused on the trading workflow: live price, current candle, intraday prediction, selective-signal validation, and news context.
+A stability-first Indian market analytics application centered on Upstox V3 live data, intraday candles, a calibrated ML model, Times of India headlines, FreeNewsApi, and optional X/Twitter context.
 
-## What changed
+## Operating policy
 
-- Yahoo/stale daily-only inference is removed from the live path.
-- Upstox Analytics Token is supported through `UPSTOX_ACCESS_TOKEN`.
-- Upstox V3 WebSocket drives the live quote and rolling 1-minute bars; V3 intraday candles are the REST recovery path. The UI polls the server state every second.
-- Supported prediction windows: 1m, 5m, 10m, 15m, 30m, 60m.
-- Prediction inference is recalculated every 30 seconds while the screen itself refreshes every second.
-- The current candle is labeled with exact start/end, timeframe, and seconds remaining; 5m/10m/15m/30m bars are session-anchored to 09:15 IST.
-- Historical training uses completed sessions only, then live inference uses the current forming candle.
-- Index context includes NIFTY 50, NIFTY BANK and INDIA VIX, with a small adaptive live-regime blend measured on the same validation window as the signal gate.
-- SENSEX is treated as a first-class live instrument (`BSE_INDEX|SENSEX`).
-- The 90% gate is now an actual measured selective-precision gate. When it is not empirically satisfied, the app says `REVALIDATE` rather than pretending a BUY/SELL is reliable.
-- FreeNewsApi.io is used via `x-api-key`. The app enforces a daily 5,000-call budget and a 2 req/s-safe client pacing rule.
-- TrustGraph, Repository Health and Signal Journal are removed from this trading-focused build.
+- Browser/live dashboard refresh: **60 seconds**, not every second.
+- Prediction/inference refresh: **5 minutes**.
+- Model retraining: **30 minutes**.
+- FreeNewsApi / X refresh: **30 minutes**.
+- Times of India category scraper: **10 minutes**.
+- Upstox WebSocket: server-side continuous stream; browser polling is deliberately decoupled.
+- When the cash market is closed, the application shows the **last real market price and last real completed candle** rather than inventing an after-hours candle.
+- BUY/SELL is never forced. The prediction, range and EOD scenario remain visible even when the statistical gate says `REVALIDATE`.
 
-## Important behavior
+## Data architecture
 
-A one-second screen refresh does **not** mean retraining the model every second. Retraining every second would add latency and amplify noise. The screen follows every live tick; the ML inference is recalculated on a slower cadence, and the model itself is retrained only on the configured model-retrain schedule or when you press **RETRAIN MODEL**.
+1. Upstox instrument master keeps the complete NSE/BSE equity directory searchable. Securities remain visible even when live history/quotes are unavailable.
+2. Upstox V3 1-minute historical candles are the base training source. Requested 5/10/15/30/60-minute bars are deterministically aggregated locally from 1-minute source data, anchored at 09:15 IST.
+3. Upstox V3 MarketDataStreamerV3 is the live source. Trade timestamps (`ltt`) are used; heartbeat/current timestamps are never converted into fake candles.
+4. Training excludes incomplete sessions. Index instruments often have zero volume, so feature engineering uses a price-based VWAP fallback rather than dropping every row.
+5. The model uses technical structure plus NIFTY 50 / NIFTY BANK / INDIA VIX context.
+6. News consists of:
+   - Times of India category pages using the supplied scraper logic.
+   - FreeNewsApi (if `NEWS_API_KEY` is configured).
+   - Optional X/Twitter recent-search context (`X_BEARER_TOKEN`).
+7. News is ranked for relevance to the selected instrument and Indian market before being shown to the user or applied as a small model adjustment.
 
-The system does not guarantee profits or a perfect prediction. The gate is deliberately allowed to return `REVALIDATE` when the current evidence is not strong enough.
+## Why this is stable
 
-## Local setup
+The earlier version coupled a 1-second browser loop to prediction and data calls. That created repeated REST traffic and made model failures look like live-market failures. The final version keeps the WebSocket server-side, while the browser only asks for state once per minute. The model and external news sources run on materially slower cadences.
 
-```bash
+## Prediction interpretation
+
+For a selected timeframe:
+
+- `NEXT CLOSE/HIGH/LOW` = the model's forecast for the next bar at that selected timeframe.
+- `END-OF-DAY` = the model's same-session EOD scenario.
+- Switch the selector between 5m and 10m to inspect the corresponding next-bar forecast.
+- The validation gate is based on walk-forward validation and a Wilson lower bound, not just a raw point estimate.
+
+A model cannot be guaranteed to make money or perfectly predict price. The application is intentionally designed to expose a forecast while refusing to label an empirically weak forecast as a trusted BUY/SELL.
+
+## Render environment
+
+Set:
+- `UPSTOX_ACCESS_TOKEN`
+- `NEWS_API_KEY`
+- `APP_BASE_URL`
+
+Optional:
+- `UPSTOX_CLIENT_ID`, `UPSTOX_CLIENT_SECRET`, `UPSTOX_REDIRECT_URI`
+- `X_BEARER_TOKEN`
+
+Never commit credentials to Git.
+
+## Relevant upstream API constraints
+
+Upstox V3 provides minute intervals and has documented request-rate limits; this project therefore avoids second-by-second historical/REST calls and uses the WebSocket for live state. See the linked developer documentation in the project notes.
+
+## Local run
+
+```powershell
 python -m venv .venv
-# Windows
-.venv\\Scripts\\activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
 uvicorn app.main:app --reload
 ```
 
-Put the Upstox Analytics Token in `UPSTOX_ACCESS_TOKEN` and the FreeNewsApi key in `NEWS_API_KEY`.
+## Security
 
-## Render
-
-1. Push this folder to GitHub.
-2. Create a Render Web Service or use `render.yaml`.
-3. Set `UPSTOX_ACCESS_TOKEN` and `NEWS_API_KEY` as Render environment variables.
-4. Do not commit `.env` or hard-code credentials into frontend code.
-
-## Upstox data design
-
-Upstox V3 supports intraday minute intervals from 1 through 300 and the market WebSocket provides live updates. The app uses the WebSocket for the live quote and local current-candle construction, while V3 historical/intraday candle APIs supply training and recovery data.
-
-## News budget
-
-The 5,000-call quota is treated as a **hard daily ceiling**, not a target to burn. Requests are cached and paced at 0.51s minimum spacing so the published 2 req/s provider ceiling is respected. The current news layer is cached and paced to stay within the provider's published 2 requests/second limit, with a 5,000-request daily ceiling. The dashboard shows today's used and remaining budget.
-
-## Sources
-
-- Upstox Analytics Token: https://upstox.com/developer/api-documentation/analytics-token/
-- Upstox Market Data Feed V3: https://upstox.com/developer/api-documentation/v3/get-market-data-feed/
-- Upstox Intraday Candle V3: https://upstox.com/developer/api-documentation/v3/get-intra-day-candle-data/
-- Upstox Historical Candle V3: https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/
-- FreeNewsApi.io: https://www.freenewsapi.io/docs/
-
-## Disclaimer
-
-This application is for analytical/paper-trading use. It does not place trades and does not guarantee future returns.
+Rotate any API credential that has been exposed in chat, screenshots, source control, or logs.

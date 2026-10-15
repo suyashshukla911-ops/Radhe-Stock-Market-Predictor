@@ -25,12 +25,20 @@ services:
         value: "5000"
       - key: NEWS_MIN_INTERVAL_SECONDS
         value: "4.5"
-      - key: LIVE_POLL_SECONDS
-        value: "1"
-      - key: PREDICTION_REFRESH_SECONDS
+      - key: NEWS_REFRESH_MINUTES
         value: "30"
+      - key: TOI_REFRESH_MINUTES
+        value: "10"
+      - key: X_REFRESH_MINUTES
+        value: "30"
+      - key: X_BEARER_TOKEN
+        sync: false
+      - key: LIVE_POLL_SECONDS
+        value: "60"
+      - key: PREDICTION_REFRESH_SECONDS
+        value: "300"
       - key: WATCH_REFRESH_SECONDS
-        value: "15"
+        value: "300"
       - key: MODEL_RETRAIN_MINUTES
         value: "30"
       - key: TRAIN_DAYS_SHORT
@@ -41,3 +49,7 @@ services:
         value: "300"
       - key: CHART_BARS
         value: "180"
+      - key: HISTORY_CACHE_MINUTES
+        value: "20"
+      - key: LIVE_REST_CACHE_SECONDS
+        value: "60"
