@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radhe Stock Market Predictor</title>
+<link rel="stylesheet" href="/static/styles.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div><div class="brand">RADHE STOCK MARKET PREDICTOR</div><div class="sub">Live Upstox feed · intraday ML · real-time re-pricing</div></div>
+  <div class="top-actions"><span id="status" class="status">Connecting…</span></div>
+</header>
+<main class="shell">
+  <section class="hero">
+    <div class="hero-main">
+      <div class="eyebrow">LIVE MARKET ENGINE</div>
+      <h1>Trade the market that is actually moving — not yesterday’s chart.</h1>
+      <p>Upstox WebSocket ticks drive the live candle. The prediction is recalculated from the current market state instead of reusing an end-of-day dataset.</p>
+      <div class="market-strip">
+        <span class="live-dot"></span><b id="feed-age">—</b><span>data age</span>
+        <span class="divider"></span><b id="candle-clock">—</b><span>current candle</span>
+      </div>
+    </div>
+    <div class="hero-side">
+      <div class="small-label">SAFETY GATE</div>
+      <strong id="gate-title">REVALIDATE</strong>
+      <span id="gate-copy">A BUY/SELL is shown only when selective-signal validation clears the configured quality gate.</span>
+      <span class="fine">Analytics only. No order placement is included.</span>
+    </div>
+  </section>
+
+  <section class="control-card">
+    <div class="field search"><label>Instrument</label><input id="symbol" list="priority-list" value="SENSEX" placeholder="SENSEX, NIFTY 50, HDFCBANK…"><datalist id="priority-list"></datalist></div>
+    <div class="field small"><label>Timeframe</label><select id="interval"><option value="1">1m</option><option value="5" selected>5m</option><option value="10">10m</option><option value="15">15m</option><option value="30">30m</option><option value="60">60m</option></select></div>
+    <button id="analyze" class="btn primary">START LIVE</button><button id="retrain" class="btn ghost">RETRAIN MODEL</button>
+  </section>
+
+  <section class="live-panel">
+    <div class="live-price"><span class="small-label">LIVE PRICE</span><strong id="current">—</strong><span id="timestamp">—</span></div>
+    <div class="metric"><span>NEXT CLOSE</span><strong id="next-close">—</strong></div>
+    <div class="metric"><span>NEXT HIGH</span><strong id="next-high">—</strong></div>
+    <div class="metric"><span>NEXT LOW</span><strong id="next-low">—</strong></div>
+    <div class="metric"><span>EOD SCENARIO</span><strong id="eod-close">—</strong></div>
+    <div class="metric signal"><span>ACTION</span><strong id="signal">—</strong></div>
+  </section>
+
+  <section class="grid">
+    <div class="panel chart-panel"><div class="panel-head"><div><h2 id="title">SENSEX · 5m</h2><span id="candle-label" class="muted">—</span></div><div id="probability" class="pill">UP —</div></div><div id="chart"></div></div>
+    <div class="panel side-panel">
+      <div class="section-title">Prediction</div>
+      <div class="prediction-box"><span>Up probability</span><b id="up-p">—</b><small id="down-p">—</small></div>
+      <div class="prediction-box"><span>Model status</span><b id="model-status">—</b><small id="model-age">—</small></div>
+      <div class="section-title space">Validation</div>
+      <div id="validation" class="validation"></div>
+    </div>
+  </section>
+
+  <section class="grid lower">
+    <div class="panel"><div class="panel-head"><div><h2>News impact</h2><span class="muted">FreeNewsApi · market-aware refresh</span></div><div id="news-score" class="pill">Impact —</div></div><div id="news-summary" class="news-summary"></div><div id="news-list" class="news-list"></div><div class="quota" id="news-quota">News quota: —</div></div>
+    <div class="panel"><div class="panel-head"><div><h2>India market pulse</h2><span class="muted">Live quote universe</span></div><button id="pulse" class="btn ghost">REFRESH</button></div><div id="pulse-grid" class="pulse-grid"></div></div>
+  </section>
+
+  <footer><span>Market data: Upstox V3 + WebSocket. News: FreeNewsApi.</span><span>Live price/candle refresh: 1s UI · model/news recalculation: configured cadence · no profit guarantee.</span></footer>
+</main>
+<script src="/static/app.js"></script>
+</body></html>
