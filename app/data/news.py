@@ -253,11 +253,14 @@ class NewsService:
         combined.sort(key=lambda x: (float(x.get("relevance",0))*2 + abs(float(x.get("impact",0)))), reverse=True)
         top=combined[: self.max_records]
         summary=self.aggregate(top)
+        display=self.display_snapshot(symbol,company)
         return {
             "summary":summary,
             "articles":top,
+            "display_articles":display["articles"],
+            "download_url":display["download_url"],
             "diagnostics":self.diagnostics(),
-            "toi":{"fetched_at":toi.fetched_at if toi else None,"sections_ok":toi.sections_ok if toi else 0,"sections_total":toi.sections_total if toi else len(__import__('app.data.toi',fromlist=['SECTIONS']).SECTIONS)},
+            "toi":{"fetched_at":display["fetched_at"],"sections_ok":display["sections_ok"],"sections_total":display["sections_total"]},
         }
 
     @staticmethod
@@ -279,6 +282,49 @@ class NewsService:
             "impact":round(max(-1,min(1,sum(impacts)/len(impacts))),4),
             **counts,"top_event":max(events,key=events.get) if events else "none"
         }
+
+    def export_toi_excel(self) -> Path:
+        """Export the current TOI snapshot in the same shape as the provided scraper."""
+        snap=self._toi.get()
+        if snap is None:
+            try:
+                snap=self._toi.refresh()
+            except Exception:
+                snap=self._toi.get()
+        if snap is None:
+            raise RuntimeError("Times of India news is not available yet.")
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import Font, Alignment
+        out=Path(self._toi.state_file).with_name("toi_market_news.xlsx")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        wb=Workbook(); ws=wb.active; ws.title="news"
+        headers=["scraped_at_utc","source","section","headline_clean","url","category_page","model_text"]
+        ws.append(headers)
+        for row in snap.headlines:
+            ws.append([row.get("scraped_at",""),row.get("source","Times of India"),row.get("section",""),row.get("title",""),row.get("url",""),row.get("category_page",""),f"{row.get('section','')} | {row.get('title','')}"])
+        for c in ws[1]:
+            c.font=Font(bold=True); c.alignment=Alignment(vertical="top")
+        for row in ws.iter_rows():
+            for cell in row: cell.alignment=Alignment(vertical="top",wrap_text=True)
+        ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
+        for col,w in {"A":26,"B":20,"C":24,"D":90,"E":90,"F":70,"G":100}.items(): ws.column_dimensions[col].width=w
+        meta=wb.create_sheet("run_metadata")
+        meta.append(["field","value"]); meta.append(["fetched_at_utc",snap.fetched_at]); meta.append(["sections_ok",snap.sections_ok]); meta.append(["sections_total",snap.sections_total]); meta.append(["headline_count",len(snap.headlines)])
+        wb.save(out)
+        check=load_workbook(out,read_only=True); check.close()
+        return out
+
+    def display_snapshot(self, symbol: str, company: str) -> dict:
+        """User-facing news: Times of India headlines only."""
+        toi=self._toi.get()
+        rows=toi.headlines if toi else []
+        ranked=[]
+        for row in rows:
+            item=dict(row)
+            item["relevance"]=relevance_score(item.get("title",""),symbol,company,item.get("section",""))
+            ranked.append(item)
+        ranked.sort(key=lambda x:(float(x.get("relevance",0)),x.get("scraped_at","")),reverse=True)
+        return {"articles":ranked[:10],"fetched_at":toi.fetched_at if toi else None,"sections_ok":toi.sections_ok if toi else 0,"sections_total":toi.sections_total if toi else len(__import__('app.data.toi',fromlist=['SECTIONS']).SECTIONS),"download_url":"/api/news/download"}
 
     def diagnostics(self):
         toi=self._toi.get()

@@ -1,5 +1,5 @@
 const $=id=>document.getElementById(id);
-const state={symbol:"SENSEX",interval:5,lastAnalysis:null,lastAnalysisAt:0,lastInstrumentKey:null,busy:false,predictionCadenceMs:300000};
+const state={symbol:"SENSEX",interval:"5",lastAnalysis:null,lastAnalysisAt:0,lastInstrumentKey:null,busy:false,predictionCadenceMs:300000};
 
 function fmt(v,d=2){return Number.isFinite(Number(v))?Number(v).toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d}):"—"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -28,10 +28,9 @@ function drawChart(rows,pred){
 }
 
 function clearPrediction(){
+  state.lastAnalysis=null; state.lastAnalysisAt=0;
   ["current","next-close","next-high","next-low","eod-close","signal","up-p","down-p","model-status","model-age","probability","title","timestamp","candle-label","candle-clock"].forEach(id=>{if($(id))$(id).textContent="—"});
   $("validation").innerHTML="";
-  $("news-summary").innerHTML="";
-  $("news-list").innerHTML="";
 }
 function renderValidation(v){
   const items=[
@@ -47,18 +46,17 @@ function renderValidation(v){
   $("validation").innerHTML=items.map(([a,b])=>`<div class="val"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join("");
 }
 function renderNews(n){
-  const s=n?.summary||{},impact=Number(s.impact||0);
-  $("news-score").textContent=`Impact ${impact>=0?"+":""}${impact.toFixed(3)}`;
-  $("news-score").className="pill "+(impact>0.15?"good":impact<-0.15?"bad":"warn");
-  $("news-summary").innerHTML=[
-    ["Headlines",s.headline_count||0],["Positive",s.positive||0],["Negative",s.negative||0],["Neutral",s.neutral||0]
-  ].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");
-  $("news-list").innerHTML=(n.articles||[]).slice(0,12).map(a=>{
-    const when=a.published_at||a.scraped_at||"";
-    return `<article class="news-item"><a href="${esc(a.url||"#")}" target="_blank" rel="noopener">${esc(a.title||"")}</a><div class="news-meta"><span>${esc(a.source||a.publisher||"")}</span><span>${esc(a.section||a.event||"")}</span><span>${Number(a.sentiment)>0.15?"positive":Number(a.sentiment)<-0.15?"negative":"neutral"}</span><span>${when?new Date(when).toLocaleString("en-IN"):"fresh section headline"}</span></div></article>`;
-  }).join("")||`<div class="muted">No fresh market-linked headlines available yet.</div>`;
-  const q=n.diagnostics||{},t=n.toi||{};
-  $("news-quota").textContent=`FreeNewsApi: ${q.used_today??0}/${q.daily_limit??5000} today · TOI sections: ${t.sections_ok??0}/${t.sections_total??0} · X/Twitter: ${q.x_configured?"configured":"not configured"}`;
+  const rows=(n?.display_articles||[]).slice(0,10);
+  const toi=n?.toi||{};
+  $("news-score").textContent=`${rows.length} top stories`;
+  $("news-score").className="pill good";
+  $("news-summary").innerHTML=[["Top stories",rows.length],["Source","Times of India"],["Updated",toi.fetched_at?new Date(toi.fetched_at).toLocaleTimeString("en-IN")||"—":"—"],["Download","Excel"]].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");
+  $("news-list").innerHTML=rows.map((a,i)=>{
+    const when=a.scraped_at||"";
+    return `<article class="news-item"><div class="news-rank">${i+1}</div><div><a href="${esc(a.url||"#")}" target="_blank" rel="noopener">${esc(a.title||"")}</a><div class="news-meta"><span>${esc(a.section||"Markets")}</span><span>${when?new Date(when).toLocaleString("en-IN"):"Latest"}</span></div></div></article>`;
+  }).join("")||`<div class="muted">Top Times of India headlines are loading. Please check again shortly.</div>`;
+  $("news-quota").textContent=toi.fetched_at?`Latest Times of India update: ${new Date(toi.fetched_at).toLocaleString("en-IN")}`:"Waiting for the latest Times of India headlines…";
+  $("news-download").href=n?.download_url||"/api/news/download";
 }
 function renderAnalysis(d){
   state.lastAnalysis=d;
@@ -101,6 +99,14 @@ function renderLive(d){
   }
   if(d.tick?.trade_time)$("timestamp").textContent=status==="OPEN"?`Live ${new Date(d.tick.trade_time).toLocaleTimeString("en-IN")}`:`Last trade ${new Date(d.tick.trade_time).toLocaleString("en-IN")}`;
   if(d.candles?.length && !state.lastAnalysis)drawChart(d.candles,null);
+  if(d.view_only){
+    $("title").textContent=`${d.symbol} · 1D`;
+    $("next-close").textContent="—"; $("next-high").textContent="—"; $("next-low").textContent="—"; $("eod-close").textContent="—";
+    $("signal").textContent="VIEW ONLY"; $("signal-note").textContent="Previous-session history";
+    $("model-status").textContent="DAILY HISTORY"; $("model-age").textContent="Select an intraday timeframe for prediction";
+    $("validation").innerHTML=""; $("policy-box").textContent="Daily view shows previous sessions; intraday timeframes are used for predictions.";
+    $("timestamp").textContent=d.current_candle?.start?`Last session ${new Date(d.current_candle.start).toLocaleDateString("en-IN")}`:"Last session";
+  }
   if(d.prediction && !state.lastAnalysis){
     const fake={...d,prediction:d.prediction,last_timestamp:d.current_candle?.start||d.tick?.trade_time,current_price:d.tick?.price??d.market_data.last_market_price,candles:d.candles,instrument:{name:d.symbol},interval:state.interval,news:{summary:{},articles:[],diagnostics:{}},market_state:{market_status:status,model_cache_age_seconds:0,model_retrain_minutes:30},refresh_policy:{browser_seconds:60,prediction_seconds:300,news_minutes:30,toi_minutes:10}};
     renderAnalysis(fake);
@@ -112,44 +118,48 @@ async function initialLive(){
 }
 async function analyze(force=false){
   if(state.busy)return;
+  if(state.interval==="1d"){await initialLive();return;}
   state.busy=true;
-  $("analyze").disabled=true;
+  $("analyze").disabled=true; $("retrain").disabled=true;
+  $("status").textContent=force?`RETRAINING ${state.symbol}…`:`ANALYZING ${state.symbol} ${state.interval}m…`;
   try{
-    const d=await getJSON(`/api/analyze?symbol=${encodeURIComponent(state.symbol)}&interval=${state.interval}&retrain=${force}`);
+    const d=await getJSON(`/api/analyze?symbol=${encodeURIComponent(state.symbol)}&interval=${encodeURIComponent(state.interval)}&retrain=${force}`);
     state.lastInstrumentKey=d.instrument.instrument_key;
     renderAnalysis(d);
     $("status").textContent=d.market_state.market_status==="OPEN"?(d.market_state.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · REST RECOVERY"):"● MARKET CLOSED · LAST SESSION";
     $("status").className=d.market_state.market_status==="OPEN"?"status live":"status closed";
-  }catch(e){
-    $("status").textContent=`MODEL: ${e.message}`;
-    $("status").className="status error";
-  }finally{state.busy=false;$("analyze").disabled=false}
+  }catch(e){ $("status").textContent=`MODEL: ${e.message}`; $("status").className="status error"; }
+  finally{state.busy=false;$("analyze").disabled=false;$("retrain").disabled=false}
 }
 async function pulse(){
   try{
     const d=await getJSON("/api/market-pulse?limit=30");
-    $("pulse-grid").innerHTML=(d.results||[]).slice(0,20).map(x=>`<div class="pulse-item"><b>${esc(x.symbol)}</b><span>${esc(x.name)}</span><strong class="${Number(x.change_pct)>=0?"up":"down"}">${x.change_pct==null?"—":(Number(x.change_pct)>=0?"+":"")+Number(x.change_pct).toFixed(2)+"%"}</strong><small>${x.price==null?"—":fmt(x.price)}</small></div>`).join("");
+    $("pulse-grid").innerHTML=(d.results||[]).slice(0,20).map(x=>`<button class="pulse-item" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name)}</span><strong class="${Number(x.change_pct)>=0?"up":"down"}">${x.change_pct==null?"—":(Number(x.change_pct)>=0?"+":"")+Number(x.change_pct).toFixed(2)+"%"}</strong><small>${x.price==null?"—":fmt(x.price)}</small></button>`).join("");
+    document.querySelectorAll(".pulse-item").forEach(b=>b.addEventListener("click",async()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;clearPrediction();$("status").textContent=`LOADING ${state.symbol}…`;window.scrollTo({top:0,behavior:"smooth"});await initialLive().catch(()=>{});if(state.interval!=="1d")await analyze(false)}));
   }catch(e){$("pulse-grid").innerHTML=`<div class="muted">${esc(e.message)}</div>`}
 }
 async function newsRefresh(){
   try{const d=await getJSON(`/api/news?symbol=${encodeURIComponent(state.symbol)}&name=${encodeURIComponent(state.symbol)}`);renderNews(d)}catch(e){$("news-quota").textContent=e.message}
 }
 async function loadUniverse(query=""){
+  const button=$("universe-search-btn"), status=$("search-status");
   try{
-    const url=query?`/api/stocks?q=${encodeURIComponent(query)}&limit=50`:"/api/universe";
+    button.disabled=true; button.textContent="SEARCHING…"; status.textContent=query?`Searching for “${query}”…`:"Loading listed securities…";
+    const url=query?`/api/stocks?q=${encodeURIComponent(query)}&limit=50`:`/api/universe`;
     const d=await getJSON(url);
-    if(!query){$("universe-badge").textContent=`DIRECTORY ${(d.total||0).toLocaleString("en-IN")}`;renderUniverse(d.results||[]);}
-    else renderUniverse(d.results||[]);
-  }catch(e){$("universe-results").innerHTML=`<div class="muted">${esc(e.message)}</div>`}
+    if(!query){$("universe-badge").textContent=`DIRECTORY ${(d.total||0).toLocaleString("en-IN")}`;renderUniverse(d.results||[]);status.textContent=`Showing ${(d.results||[]).length.toLocaleString("en-IN")} of ${(d.total||0).toLocaleString("en-IN")} listed securities.`;}
+    else {renderUniverse(d.results||[]);status.textContent=`${(d.results||[]).length} result(s) found for “${query}”. Click a row to load it.`;}
+  }catch(e){$("universe-results").innerHTML=`<div class="muted">${esc(e.message)}</div>`;status.textContent=`Search failed: ${e.message}`}
+  finally{button.disabled=false;button.textContent="SEARCH"}
 }
 function renderUniverse(rows){
   $("universe-results").innerHTML=(rows||[]).slice(0,60).map(x=>`<button class="stock-row" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name||"")}</span><small>${esc(x.exchange||"")}</small></button>`).join("")||`<div class="muted">No securities matched.</div>`;
-  document.querySelectorAll(".stock-row").forEach(b=>b.addEventListener("click",()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;clearPrediction();initialLive().then(()=>analyze(false)).catch(()=>analyze(false));window.scrollTo({top:0,behavior:"smooth"})}));
+  document.querySelectorAll(".stock-row").forEach(b=>b.addEventListener("click",async()=>{state.symbol=b.dataset.symbol;$("symbol").value=state.symbol;$("search-status").textContent=`Selected ${state.symbol}. Loading market data…`;clearPrediction();window.scrollTo({top:0,behavior:"smooth"});await initialLive().catch(()=>{});if(state.interval!=="1d")await analyze(false)}));
 }
 async function boot(){
   try{
     const h=await getJSON("/api/health");
-    state.predictionCadenceMs=Math.max(120000,Number(h.prediction_refresh_seconds||300)*1000);
+    state.predictionCadenceMs=Math.max(120000,Number(h.prediction_refresh_seconds||300)*1000); state.interval=$("interval").value;
     $("status").textContent=h.upstox_connected?"● UPSTOX READY":"○ UPSTOX TOKEN MISSING";
     const p=await getJSON("/api/priority");
     $("priority-list").innerHTML=p.stocks.map(s=>`<option value="${esc(s.symbol)}">${esc(s.name)}</option>`).join("");
@@ -174,8 +184,8 @@ async function refreshAll(){
 
 $("analyze").addEventListener("click",()=>analyze(false));
 $("retrain").addEventListener("click",()=>analyze(true));
-$("interval").addEventListener("change",()=>{state.interval=Number($("interval").value);clearPrediction();initialLive().then(()=>analyze(false))});
-$("symbol").addEventListener("change",()=>{state.symbol=($("symbol").value||"SENSEX").trim();clearPrediction();initialLive().then(()=>analyze(false))});
+$("interval").addEventListener("change",async()=>{state.interval=$("interval").value;clearPrediction();$("retrain").disabled=state.interval==="1d";$("status").textContent=`LOADING ${state.interval.toUpperCase()}…`;await initialLive();if(state.interval!=="1d")await analyze(false)});
+$("symbol").addEventListener("change",async()=>{state.symbol=($("symbol").value||"SENSEX").trim();clearPrediction();$("status").textContent=`LOADING ${state.symbol.toUpperCase()}…`;await initialLive();if(state.interval!=="1d")await analyze(false)});
 $("symbol").addEventListener("keydown",e=>{if(e.key==="Enter")$("symbol").dispatchEvent(new Event("change"))});
 $("pulse").addEventListener("click",pulse);
 $("universe-search-btn").addEventListener("click",()=>loadUniverse($("universe-search").value.trim()));
@@ -184,5 +194,5 @@ $("universe-search").addEventListener("keydown",e=>{if(e.key==="Enter")$("univer
 boot();
 setInterval(async()=>{await initialLive().catch(()=>{})},60000);
 setInterval(async()=>{if(!state.busy && Date.now()-state.lastAnalysisAt>=state.predictionCadenceMs){await analyze(false).catch(()=>{})}},60000);
-setInterval(async()=>{await newsRefresh().catch(()=>{})},1800000);
+setInterval(async()=>{await newsRefresh().catch(()=>{})},600000);
 setInterval(async()=>{await pulse().catch(()=>{})},300000);

@@ -108,24 +108,35 @@ def market_pulse(limit:int=Query(30,ge=10,le=50)):
 def news_endpoint(symbol:str="SENSEX",name:str="SENSEX"):
     return news.snapshot(symbol,name)
 
+@app.get("/api/news/download")
+def news_download():
+    try:
+        path=news.export_toi_excel()
+        return FileResponse(path,path=path,filename="toi_market_news.xlsx",media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as exc:
+        raise HTTPException(503,str(exc))
+
 @app.get("/api/news/quota")
 def news_quota(): return news.diagnostics()
 
 @app.get("/api/analyze")
-def analyze(symbol:str=Query(...,min_length=1,max_length=100),interval:int=Query(5,ge=1,le=60),retrain:bool=False):
-    if interval not in {1,5,10,15,30,60}: raise HTTPException(422,"Supported timeframes: 1,5,10,15,30,60 minutes.")
+def analyze(symbol:str=Query(...,min_length=1,max_length=100),interval:str=Query("5"),retrain:bool=False):
+    if interval not in {"1","5","10","15","30","60"}:
+        raise HTTPException(422,"Prediction timeframes: 1m, 5m, 10m, 15m, 30m and 60m. Use 1D for previous-session history.")
     try:
         ins=upstox.resolve_symbol(symbol)
-        return engine.analyze(ins,interval=interval,force_retrain=retrain)
+        return engine.analyze(ins,interval=int(interval),force_retrain=retrain)
     except UpstoxError as exc: raise HTTPException(503,str(exc))
     except ValueError as exc: raise HTTPException(422,str(exc))
     except Exception as exc: raise HTTPException(500,f"Analysis failed: {exc}")
 
 @app.get("/api/live")
-def live_state(symbol:str=Query(...,min_length=1,max_length=100),interval:int=Query(5,ge=1,le=60)):
+def live_state(symbol:str=Query(...,min_length=1,max_length=100),interval:str=Query("5")):
+    if interval not in {"1","5","10","15","30","60","1d"}:
+        raise HTTPException(422,"Supported views: 1m, 5m, 10m, 15m, 30m, 60m and 1D.")
     try:
         ins=upstox.resolve_symbol(symbol)
-        return engine.live_state(ins,interval)
+        return engine.live_state(ins,interval if interval=="1d" else int(interval))
     except Exception as exc:
         # Live state is a dashboard endpoint: never turn a temporary provider
         # problem into a blank/erroring page. Return a structured 200 response
@@ -188,5 +199,5 @@ def config():
         "model_retrain_minutes":settings.model_retrain_minutes,
         "news_refresh_minutes":settings.news_refresh_minutes,
         "toi_refresh_minutes":settings.toi_refresh_minutes,
-        "supports":{"timeframes":[1,5,10,15,30,60]},
+        "supports":{"timeframes":["1","5","10","15","30","60","1d"]},
     }

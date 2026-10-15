@@ -126,6 +126,7 @@ class TOIScraper:
                 "section": section,
                 "title": headline,
                 "url": url,
+                "category_page": page_url,
                 "published_at": "",
                 "scraped_at": datetime.now(timezone.utc).isoformat(),
             })

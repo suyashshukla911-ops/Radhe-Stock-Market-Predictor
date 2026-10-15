@@ -30,6 +30,7 @@ class AnalysisEngine:
         self.last_results: dict[tuple[str,int],dict] = {}
         self._history_cache: dict[tuple[str,int],tuple[float,pd.DataFrame]] = {}
         self._context_cache: dict[tuple[str,int],tuple[float,dict[str,pd.DataFrame]]] = {}
+        self._live_view_cache: dict[tuple[str,object],tuple[float,pd.DataFrame]] = {}
         self._analysis_lock = threading.RLock()
 
     @staticmethod
@@ -46,7 +47,9 @@ class AnalysisEngine:
         return 9*60+15 <= m < 15*60+30
 
     def _history_window(self, interval):
-        return settings.train_days_short if interval<=15 else settings.train_days_long
+        if interval == "1d":
+            return max(365, settings.train_days_long * 4)
+        return settings.train_days_short if int(interval)<=15 else settings.train_days_long
 
     def _resolve_context(self):
         out={}
@@ -77,19 +80,21 @@ class AnalysisEngine:
         return {k:v.copy() for k,v in out.items()}
 
     def _get_training_cache(self,instrument,interval,force=False):
-        key=(instrument.instrument_key,interval)
+        if interval == "1d":
+            raise ValueError("Daily view is for previous-session history. Select an intraday timeframe for prediction.")
+        key=(instrument.instrument_key,int(interval))
         now=time.time()
         cached=self.models.get(key)
         if cached and not force and now-cached.fitted_at < settings.model_retrain_minutes*60:
             return cached
 
-        days=self._history_window(interval)
-        history=self._get_history(instrument,interval,days,force=force)
+        days=self._history_window(int(interval))
+        history=self._get_history(instrument,int(interval),days,force=force)
         if history.empty:
             raise UpstoxError("Upstox returned no intraday history for this instrument.")
         cutoff=self._completed_cutoff()
         history_train=history.loc[history["timestamp"].dt.date <= cutoff].copy()
-        context=self._get_context_history(interval,days,force=force)
+        context=self._get_context_history(int(interval),days,force=force)
         context_train={k:v.loc[v["timestamp"].dt.date <= cutoff].copy() for k,v in context.items()}
         train=prepare_training_frame(history_train,context=context_train)
         if len(train) < settings.min_train_rows:
@@ -109,11 +114,11 @@ class AnalysisEngine:
         self.live.subscribe([instrument.instrument_key])
         cache_key=(instrument.instrument_key,interval)
 
-        # 1) Prefer the server-side WebSocket bars while the market is live.
         try:
             live_1m=self.live.live_bars(instrument.instrument_key,1)
             if not live_1m.empty:
-                aggregated=self.upstox.aggregate_minutes(live_1m,interval)
+                aggregated=(self.upstox.aggregate_minutes(live_1m,1440) if interval == "1d"
+                            else self.upstox.aggregate_minutes(live_1m,int(interval)))
                 if not aggregated.empty:
                     self._live_view_cache[cache_key]=(time.time(),aggregated.copy())
                     return aggregated
@@ -138,7 +143,10 @@ class AnalysisEngine:
         # instead of becoming blank or inventing an after-hours candle.
         if intraday.empty:
             try:
-                days=settings.train_days_short if interval <= 15 else min(settings.train_days_long,30)
+                if interval == "1d":
+                    days=max(365, settings.train_days_long * 4)
+                else:
+                    days=settings.train_days_short if int(interval) <= 15 else min(settings.train_days_long,30)
                 historical=self.upstox.get_recent_history(instrument.instrument_key,interval,max(7,days))
                 if not historical.empty:
                     intraday=historical
@@ -156,8 +164,9 @@ class AnalysisEngine:
         return combined,live
 
     def analyze(self,instrument:Instrument,interval:int,force_retrain:bool=False):
-        if interval not in {1,5,10,15,30,60}:
-            raise ValueError("Supported timeframes: 1m, 5m, 10m, 15m, 30m, 60m.")
+        if int(interval) not in {1,5,10,15,30,60}:
+            raise ValueError("Prediction is available for 1m, 5m, 10m, 15m, 30m and 60m. The 1D option is a history view.")
+        interval=int(interval)
         key=(instrument.instrument_key,interval)
         with self._analysis_lock:
             # Reuse a recent result instead of refitting/re-hitting external services.
@@ -226,7 +235,39 @@ class AnalysisEngine:
             self.last_results[key]=result
             return {k:v for k,v in result.items() if k!="_created_at"}
 
-    def live_state(self,instrument:Instrument,interval:int):
+    def daily_view(self, instrument: Instrument):
+        bars=self._live_snapshot(instrument,"1d",ttl_seconds=settings.live_rest_cache_seconds)
+        now=datetime.now(ZoneInfo(IST))
+        rows=[]
+        if not bars.empty:
+            for r in bars.tail(settings.chart_bars).itertuples():
+                rows.append({"time":r.timestamp.isoformat(),"open":float(r.open),"high":float(r.high),"low":float(r.low),"close":float(r.close),"volume":float(r.volume or 0.0)})
+            last=bars.iloc[-1]
+            lts=pd.Timestamp(last.timestamp).tz_convert(IST)
+            tick={"price":float(last.close),"trade_time":lts.isoformat(),"updated_at":lts.isoformat(),"instrument_key":instrument.instrument_key,"session_trade":False}
+        else:
+            tick=self.live.latest(instrument.instrument_key)
+            if tick is None:
+                try:
+                    q=next(iter(self.upstox.get_quote_batch([instrument.instrument_key]).values()),{})
+                    lp=q.get("last_price") or (q.get("ohlc") or {}).get("close")
+                    tick={"price":float(lp),"trade_time":None,"updated_at":now.isoformat(),"instrument_key":instrument.instrument_key,"session_trade":False} if lp is not None else None
+                except Exception:
+                    tick=None
+        status="OPEN" if self._market_open() else ("WEEKEND" if now.weekday()>=5 else "CLOSED")
+        last_candle=None
+        if not bars.empty:
+            row=bars.iloc[-1]; ts=pd.Timestamp(row.timestamp).tz_convert(IST)
+            last_candle={"start":ts.isoformat(),"end":(ts+pd.Timedelta(days=1)).isoformat(),"open":float(row.open),"high":float(row.high),"low":float(row.low),"close":float(row.close),"volume":float(row.volume or 0.0),"forming":False}
+        age=None
+        if tick and tick.get("updated_at"):
+            try: age=round(max(0,(now-datetime.fromisoformat(tick["updated_at"])).total_seconds()),1)
+            except Exception: pass
+        return {"now":now.isoformat(),"instrument_key":instrument.instrument_key,"symbol":instrument.trading_symbol,"tick":tick,"candles":rows,"current_candle":last_candle,"seconds_to_candle_close":0,"prediction":None,"view_only":True,"market_data":{"stream_connected":self.live.connected,"stream_error":self.live.last_error,"last_update_age_seconds":age,"source":"daily-history","market_status":status,"last_market_price":float(bars.iloc[-1]["close"]) if not bars.empty else (float(tick["price"]) if tick else None),"last_market_candle":bars.iloc[-1]["timestamp"].isoformat() if not bars.empty else None}}
+
+    def live_state(self,instrument:Instrument,interval):
+        if interval == "1d":
+            return self.daily_view(instrument)
         self.live.subscribe([instrument.instrument_key])
         now=datetime.now(ZoneInfo(IST))
         open_now=self._market_open()

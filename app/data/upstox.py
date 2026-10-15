@@ -224,11 +224,14 @@ class UpstoxClient:
         out["oi"] = 0.0
         return out[["timestamp","open","high","low","close","volume","oi"]].drop_duplicates("timestamp")
 
-    def get_intraday(self, instrument_key: str, interval: int) -> pd.DataFrame:
-        # For robustness, use 1-minute source data and aggregate locally for all
-        # requested timeframes. This also gives deterministic 09:15 anchored bars.
+    def get_intraday(self, instrument_key: str, interval) -> pd.DataFrame:
+        if interval == "1d":
+            encoded = quote(instrument_key, safe="")
+            url = f"{UPSTOX_API}/v3/historical-candle/intraday/{encoded}/days/1"
+            payload = self._get_json(url)
+            return self._to_df(payload.get("data", {}).get("candles", []))
         base = self._get_intraday_1m(instrument_key)
-        return self.aggregate_minutes(base, interval)
+        return self.aggregate_minutes(base, int(interval))
 
     def _get_intraday_1m(self, instrument_key: str) -> pd.DataFrame:
         encoded = quote(instrument_key, safe="")
@@ -261,15 +264,24 @@ class UpstoxClient:
             return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
         return pd.concat(frames, ignore_index=True).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
-    def get_recent_history(self, instrument_key: str, interval: int, calendar_days: int) -> pd.DataFrame:
+    def get_daily_history(self, instrument_key: str, calendar_days: int = 365) -> pd.DataFrame:
+        now = datetime.now(ZoneInfo(IST))
+        to_date = now.date()
+        from_date = to_date - timedelta(days=max(7, calendar_days))
+        encoded = quote(instrument_key, safe="")
+        url = f"{UPSTOX_API}/v3/historical-candle/{encoded}/days/1/{to_date.isoformat()}/{from_date.isoformat()}"
+        payload = self._get_json(url)
+        return self._to_df(payload.get("data", {}).get("candles", []))
+
+    def get_recent_history(self, instrument_key: str, interval, calendar_days: int) -> pd.DataFrame:
         now = datetime.now(ZoneInfo(IST))
         to_date = now.date()
         from_date = to_date - timedelta(days=calendar_days)
-        # Always train intraday models from 1-minute source data. The V3 API
-        # permits one-month 1m slices, so 30/90-day windows are chunked.
-        if interval != 1:
+        if interval == "1d":
+            return self.get_daily_history(instrument_key, calendar_days)
+        if int(interval) != 1:
             base = self.get_historical(instrument_key, 1, from_date, to_date)
-            return self.aggregate_minutes(base, interval)
+            return self.aggregate_minutes(base, int(interval))
         return self.get_historical(instrument_key, 1, from_date, to_date)
 
     def get_quote_batch(self, instrument_keys: Iterable[str]) -> dict:
