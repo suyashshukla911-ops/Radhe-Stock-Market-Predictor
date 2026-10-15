@@ -50,6 +50,15 @@ class AnalysisEngine:
     def _history_window(self, interval:int) -> int:
         return settings.train_days_short if interval<=15 else settings.train_days_long
 
+    @staticmethod
+    def _completed_session_cutoff() -> pd.Timestamp:
+        now = datetime.now(ZoneInfo(IST))
+        minute = now.hour * 60 + now.minute
+        # During the live session, never train on today's incomplete session.
+        # Once 15:30 IST has passed, today's session is complete and becomes
+        # part of the next model fit.
+        return pd.Timestamp(now.date() if minute >= 15 * 60 + 30 else (now - pd.Timedelta(days=1)).date())
+
     def _get_training_cache(self, instrument:Instrument, interval:int, force:bool=False) -> ModelCache:
         key=(instrument.instrument_key,interval)
         now=time.time()
@@ -60,17 +69,18 @@ class AnalysisEngine:
         history=self.upstox.get_recent_history(instrument.instrument_key,interval,days)
         if history.empty:
             raise UpstoxError("No historical candles returned from Upstox for this instrument/timeframe.")
-        history_train=history.loc[history["timestamp"].dt.date < datetime.now(ZoneInfo(IST)).date()].copy()
+        cutoff = self._completed_session_cutoff().date()
+        history_train=history.loc[history["timestamp"].dt.date <= cutoff].copy()
         context_hist={}
         for label, ctx in self._resolve_context().items():
             try:
                 h=self.upstox.get_recent_history(ctx.instrument_key,interval,days)
-                context_hist[label]=h.loc[h["timestamp"].dt.date < datetime.now(ZoneInfo(IST)).date()].copy()
+                context_hist[label]=h.loc[h["timestamp"].dt.date <= cutoff].copy()
             except Exception:
                 context_hist[label]=pd.DataFrame()
         train=prepare_training_frame(history_train,context=context_hist)
         if len(train) < settings.min_train_rows:
-            raise ValueError(f"Not enough completed-session data for {instrument.trading_symbol} at {interval}m. Have {len(train)} clean rows; need {settings.min_train_rows}.")
+            raise ValueError(f"Not enough completed-session data for {instrument.trading_symbol} at {interval}m. Raw candles={len(history_train)}, clean feature rows={len(train)}, need={settings.min_train_rows}. Upstox history/resampling must provide more intraday history.")
         model=CandleModel(min_train_rows=settings.min_train_rows)
         model.fit(train,FEATURES)
         cached=ModelCache(model=model,fitted_at=now,history=history_train,context_history=context_hist)
@@ -155,20 +165,28 @@ class AnalysisEngine:
         # REST snapshot is a recovery path, never the primary 1-second UI source.
         if bars.empty:
             bars=self._intraday_snapshot(instrument.instrument_key,interval,ttl=5.0)
-        # If websocket has a price but local bar store is briefly empty, surface the tick anyway.
+        now=datetime.now(ZoneInfo(IST))
+        minute=now.hour*60+now.minute
+        market_open = minute >= 9*60+15 and minute < 15*60+30 and now.weekday() < 5
+        market_status = "OPEN" if market_open else ("WEEKEND" if now.weekday() >= 5 else "CLOSED")
+        # Never manufacture a new candle after the cash market closes.
+        if not market_open:
+            tick = tick if tick else None
         if tick is None and not bars.empty:
             last=bars.iloc[-1]
-            tick={"price":float(last.close),"trade_time":pd.Timestamp(last.timestamp).isoformat(),"updated_at":pd.Timestamp.now(tz=ZoneInfo(IST)).isoformat()}
-        now=datetime.now(ZoneInfo(IST)); current_candle=None
+            tick={"price":float(last.close),"trade_time":pd.Timestamp(last.timestamp).isoformat(),"updated_at":now.isoformat(),"instrument_key":instrument.instrument_key}
+        current_candle=None; seconds_left=None
         if not bars.empty:
-            row=bars.iloc[-1]; start=pd.Timestamp(row["timestamp"]).tz_convert(IST); end=start+pd.Timedelta(minutes=interval)
-            current_candle={"start":start.isoformat(),"end":end.isoformat(),"open":float(row.open),"high":float(row.high),"low":float(row.low),"close":float(row.close),"volume":float(row.volume)}
-            seconds_left=max(0,int((end.to_pydatetime()-now).total_seconds()))
-        else:
-            seconds_left=None
+            row=bars.iloc[-1]; start=pd.Timestamp(row["timestamp"]).tz_convert(IST)
+            end=min(start+pd.Timedelta(minutes=interval), start.normalize()+pd.Timedelta(minutes=15*60+30))
+            current_candle={"start":start.isoformat(),"end":end.isoformat(),"open":float(row.open),"high":float(row.high),"low":float(row.low),"close":float(row.close),"volume":float(row.volume),"forming":bool(market_open and start.date()==now.date() and start <= pd.Timestamp(now))}
+            if market_open and current_candle["forming"]:
+                seconds_left=max(0,int((end.to_pydatetime()-now).total_seconds()))
+            else:
+                seconds_left=0
         cached=self.last_results.get((instrument.instrument_key,interval))
         age=None
         if tick and tick.get("updated_at"):
             try: age=round(max(0.0,(now-datetime.fromisoformat(tick["updated_at"])).total_seconds()),2)
             except Exception: age=None
-        return {"now":now.isoformat(),"tick":tick,"current_candle":current_candle,"seconds_to_candle_close":seconds_left,"prediction":cached.get("prediction") if cached else None,"market_data":{"stream_connected":self.live.connected,"stream_error":self.live.last_error,"last_update_age_seconds":age,"source":"websocket" if self.live.connected and tick else "rest-recovery" if tick else "unavailable"}}
+        return {"now":now.isoformat(),"instrument_key":instrument.instrument_key,"symbol":instrument.trading_symbol,"tick":tick,"current_candle":current_candle,"seconds_to_candle_close":seconds_left,"prediction":cached.get("prediction") if cached else None,"market_data":{"stream_connected":self.live.connected,"stream_error":self.live.last_error,"last_update_age_seconds":age,"source":"websocket" if self.live.connected and tick else "rest-recovery" if tick else "unavailable","market_status":market_status}}

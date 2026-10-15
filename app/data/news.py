@@ -203,7 +203,7 @@ class NewsService:
         if symbol.upper() in {"SENSEX", "NIFTY 50", "NIFTY BANK", "INDIA VIX"}:
             term = symbol
         term = re.sub(r"\s+LIMITED$", "", term, flags=re.I).strip()
-        return self._fetch(term, refresh_seconds=9)
+        return self._fetch(term, refresh_seconds=max(5, int(settings.news_window_seconds)))
 
     @staticmethod
     def aggregate(articles: Iterable[dict]) -> dict:

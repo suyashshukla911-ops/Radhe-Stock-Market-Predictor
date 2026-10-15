@@ -24,7 +24,7 @@ services:
       - key: NEWS_DAILY_QUOTA
         value: "5000"
       - key: NEWS_MIN_INTERVAL_SECONDS
-        value: "0.51"
+        value: "4.5"
       - key: LIVE_POLL_SECONDS
         value: "1"
       - key: PREDICTION_REFRESH_SECONDS

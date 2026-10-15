@@ -77,7 +77,7 @@ class Settings:
             news_api_key=os.getenv("NEWS_API_KEY", ""),
             news_provider=os.getenv("NEWS_PROVIDER", "freenewsapi"),
             news_daily_quota=int(os.getenv("NEWS_DAILY_QUOTA", "5000")),
-            news_min_interval_seconds=float(os.getenv("NEWS_MIN_INTERVAL_SECONDS", "0.51")),
+            news_min_interval_seconds=float(os.getenv("NEWS_MIN_INTERVAL_SECONDS", "4.5")),
             news_window_seconds=int(os.getenv("NEWS_WINDOW_SECONDS", "24")),
             prediction_refresh_seconds=int(os.getenv("PREDICTION_REFRESH_SECONDS", "30")),
             live_poll_seconds=int(os.getenv("LIVE_POLL_SECONDS", "1")),

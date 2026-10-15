@@ -1,4 +1,4 @@
-const $=id=>document.getElementById(id);let state={timer:null,liveTimer:null,lastAnalysisAt:0,lastSymbol:"SENSEX",lastInterval:5,analysis:null};
+const $=id=>document.getElementById(id);let state={timer:null,liveTimer:null,lastAnalysisAt:0,lastSymbol:"SENSEX",lastInterval:5,analysis:null,lastInstrumentKey:null};
 function fmt(v,d=2){return Number.isFinite(Number(v))?Number(v).toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d}):"—"}
 function pct(v){return Number.isFinite(Number(v))?`${(Number(v)*100).toFixed(2)}%`:"—"}
 async function getJSON(url){const r=await fetch(url,{cache:"no-store"});const j=await r.json();if(!r.ok)throw new Error(j.detail||"Request failed");return j}
@@ -7,12 +7,42 @@ function drawChart(rows,pred){if(!rows?.length)return;const x=rows.map(r=>r.time
 function renderValidation(v){const items=[["Direction accuracy",`${v.direction_accuracy.toFixed(2)}%`],["Selective precision",`${v.signal_precision.toFixed(2)}%`],["Coverage",`${v.signal_coverage.toFixed(2)}%`],["Brier",v.calibrated_brier.toFixed(5)],["Threshold",v.threshold.toFixed(2)],["Gate ≥90%",v.gate_90_passed?"PASS":"REVALIDATE"]];$("validation").innerHTML=items.map(([a,b])=>`<div class="val"><span>${a}</span><b>${b}</b></div>`).join("")}
 function renderNews(n){const s=n.summary||{};const impact=Number(s.impact||0);$("news-score").textContent=`Impact ${impact>=0?"+":""}${impact.toFixed(3)}`;$("news-score").className="pill "+(impact>0.15?"good":impact<-0.15?"bad":"warn");$("news-summary").innerHTML=`<div><b>${s.headline_count||0}</b><span>headlines</span></div><div><b>${s.positive||0}</b><span>positive</span></div><div><b>${s.negative||0}</b><span>negative</span></div>`;$("news-list").innerHTML=(n.articles||[]).map(a=>`<article class="news-item"><a href="${a.url||"#"}" target="_blank" rel="noopener noreferrer">${a.title}</a><div class="news-meta"><span>${a.publisher||"unknown"}</span><span>${a.event||"other"}</span><span>${a.sentiment>0.15?"positive":a.sentiment<-0.15?"negative":"neutral"}</span><span>${new Date(a.published_at).toLocaleString("en-IN")}</span></div></article>`).join("")||`<div class="muted">No fresh market-linked headlines found.</div>`;const q=n.diagnostics||{};$("news-quota").textContent=`News quota today: ${q.used_today??0} used / ${q.daily_limit??5000} · ${q.remaining_today??0} remaining`}
 function renderAnalysis(d){state.analysis=d;const p=d.prediction,v=p.validation;$("title").textContent=`${d.instrument.name} · ${d.interval}m`;$("timestamp").textContent=`Prediction built from ${new Date(d.last_timestamp).toLocaleString("en-IN")}`;$("current").textContent=fmt(d.current_price);$("next-close").textContent=fmt(p.predicted_close);$("next-high").textContent=fmt(p.predicted_high);$("next-low").textContent=fmt(p.predicted_low);$("eod-close").textContent=fmt(p.predicted_eod_close);$("signal").textContent=p.signal;$("gate-title").textContent=v.gate_90_passed?"SELECTIVE SIGNAL GATE PASSED":"REVALIDATE";$("gate-copy").textContent=v.gate_90_passed?`Historical selective precision ${v.signal_precision.toFixed(2)}% clears the configured 90% gate.`:`Historical selective precision is ${v.signal_precision.toFixed(2)}%; the system refuses a BUY/SELL until the 90% gate is supported.`;const up=p.probability_up;$("probability").textContent=`UP ${(up*100).toFixed(1)}% · DOWN ${((1-up)*100).toFixed(1)}%`;$("probability").className="pill "+(up>=0.65?"good":up<=0.35?"bad":"warn");$("up-p").textContent=(up*100).toFixed(1)+"%";$("down-p").textContent=((1-up)*100).toFixed(1)+"% down";$("model-status").textContent=v.gate_90_passed?"QUALIFIED":"REVALIDATE";$("model-age").textContent=`Model refreshed ${Math.round(d.market_state.model_cache_age_seconds)}s ago`;renderValidation(v);renderNews(d.news);drawChart(d.candles,p);state.lastAnalysisAt=Date.now()}
-async function analyze(force=false){const symbol=($("symbol").value||"SENSEX").trim(),interval=Number($("interval").value);state.lastSymbol=symbol;state.lastInterval=interval;$("analyze").disabled=true;try{const d=await getJSON(`/api/analyze?symbol=${encodeURIComponent(symbol)}&interval=${interval}&retrain=${force}`);renderAnalysis(d);$("status").textContent=d.market_state.stream_connected?"● LIVE · UPSTOX STREAM":"○ REST FALLBACK";$("status").className="status live"}catch(e){$("status").textContent=e.message;$("status").className="status error"}finally{$("analyze").disabled=false}}
-async function liveTick(){if(!state.lastSymbol)return;try{const d=await getJSON(`/api/live?symbol=${encodeURIComponent(state.lastSymbol)}&interval=${state.lastInterval}`);if(d.tick){$("current").textContent=fmt(d.tick.price);const age=d.market_data.last_update_age_seconds;$("feed-age").textContent=age==null?"—":`${age.toFixed(1)}s`;$("candle-clock").textContent=d.current_candle?marketCandleLabel(d.current_candle.start,d.current_candle.end,d.seconds_to_candle_close):"—";$("candle-label").textContent=d.current_candle?marketCandleLabel(d.current_candle.start,d.current_candle.end,d.seconds_to_candle_close):`No live candle yet`;$("timestamp").textContent=`Live tick ${new Date(d.tick.trade_time).toLocaleTimeString("en-IN")}`;$("status").textContent=d.market_data.stream_connected?"● LIVE · 1s UI refresh":"○ REST / waiting for WebSocket"}else{$("feed-age").textContent="waiting"}}
-catch(e){$("status").textContent=e.message}}
+async function analyze(force=false){
+  const symbol=($("symbol").value||"SENSEX").trim(),interval=Number($("interval").value);
+  state.lastSymbol=symbol; state.lastInterval=interval; state.analysis=null; state.lastInstrumentKey=null;
+  // Clear stale values immediately so NIFTY data can never remain visible while SENSEX is selected.
+  ["current","next-close","next-high","next-low","eod-close","signal","up-p","down-p","model-status","model-age","probability","title","timestamp","candle-label","candle-clock"].forEach(id=>{ if($(id)) $(id).textContent="—"; });
+  $("chart").innerHTML="";
+  $("validation").innerHTML="";
+  $("status").textContent="Loading live data…";
+  $("analyze").disabled=true;
+  try{
+    const d=await getJSON(`/api/analyze?symbol=${encodeURIComponent(symbol)}&interval=${interval}&retrain=${force}`);
+    renderAnalysis(d); state.lastInstrumentKey=d.instrument.instrument_key;
+    $("status").textContent=d.market_state.stream_connected?"● LIVE · UPSTOX STREAM":"○ REST FALLBACK"; $("status").className="status live";
+  }catch(e){
+    $("status").textContent=e.message; $("status").className="status error";
+  }finally{ $("analyze").disabled=false; }
+}
+async function liveTick(){
+  if(!state.lastSymbol)return;
+  try{
+    const d=await getJSON(`/api/live?symbol=${encodeURIComponent(state.lastSymbol)}&interval=${state.lastInterval}`);
+    if(d.instrument_key && state.lastInstrumentKey && d.instrument_key!==state.lastInstrumentKey) return;
+    if(d.tick && Number.isFinite(Number(d.tick.price))){
+      $("current").textContent=fmt(d.tick.price);
+      const age=d.market_data.last_update_age_seconds; $("feed-age").textContent=age==null?"—":`${age.toFixed(1)}s`;
+      if(d.current_candle){ $("candle-clock").textContent=marketCandleLabel(d.current_candle.start,d.current_candle.end,d.seconds_to_candle_close); $("candle-label").textContent=d.market_data.market_status==="OPEN"?marketCandleLabel(d.current_candle.start,d.current_candle.end,d.seconds_to_candle_close):`Market ${d.market_data.market_status.toLowerCase()} · last candle ${marketCandleLabel(d.current_candle.start,d.current_candle.end,0)}`; }
+      $("timestamp").textContent=`Live ${new Date(d.tick.trade_time).toLocaleTimeString("en-IN")}`;
+      $("status").textContent=d.market_data.market_status==="OPEN"?(d.market_data.stream_connected?"● LIVE · 1s UI refresh":"○ REST / waiting for WebSocket"): `● MARKET ${d.market_data.market_status}`;
+    } else {
+      $("current").textContent="—"; $("feed-age").textContent="—";
+    }
+  }catch(e){$("status").textContent=e.message;}
+}
 async function boot(){try{const h=await getJSON("/api/health");predictionCadenceMs=Math.max(15000,Number(h.prediction_refresh_seconds||30)*1000);$("status").textContent=h.upstox_connected?"● UPSTOX READY":"○ UPSTOX TOKEN MISSING";const p=await getJSON("/api/priority");$("priority-list").innerHTML=p.stocks.map(s=>`<option value="${s.symbol}">${s.name}</option>`).join("");await pulse();await analyze(false)}catch(e){$("status").textContent=e.message;$("status").className="status error"}}
 async function pulse(){try{const d=await getJSON("/api/market-pulse?limit=30");$("pulse-grid").innerHTML=(d.results||[]).slice(0,20).map(x=>`<div class="pulse-item"><b>${x.symbol}</b><span>${x.name}</span><strong class="${Number(x.change_pct)>=0?"up":"down"}">${Number(x.change_pct)>=0?"+":""}${Number(x.change_pct).toFixed(2)}%</strong></div>`).join("")}catch(e){$("pulse-grid").innerHTML=`<div class="muted">${e.message}</div>`}}
-$("analyze").addEventListener("click",()=>analyze(false));$("retrain").addEventListener("click",()=>analyze(true));$("pulse").addEventListener("click",pulse);$("interval").addEventListener("change",()=>analyze(false));$("symbol").addEventListener("keydown",e=>{if(e.key==="Enter")analyze(false)});boot();setInterval(liveTick,1000);
+$("analyze").addEventListener("click",()=>analyze(false));$("retrain").addEventListener("click",()=>analyze(true));$("pulse").addEventListener("click",pulse);$("interval").addEventListener("change",()=>analyze(false));$("symbol").addEventListener("keydown",e=>{if(e.key==="Enter")analyze(false)});$("symbol").addEventListener("change",()=>analyze(false));boot();setInterval(liveTick,1000);
 // The screen follows the live feed every second; ML/news re-analysis follows the server cadence.
 let predictionCadenceMs=30000;
 setInterval(()=>{if(state.lastSymbol && Date.now()-state.lastAnalysisAt>=predictionCadenceMs)analyze(false)},1000);

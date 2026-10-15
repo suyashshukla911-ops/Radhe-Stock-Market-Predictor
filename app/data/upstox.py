@@ -8,10 +8,13 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.config import INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES
 
@@ -47,6 +50,8 @@ class UpstoxClient:
     def __init__(self, access_token: str = "", cache_dir: str = "data_cache"):
         self.access_token = access_token.strip()
         self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=Retry(total=2, backoff_factor=0.15, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset({"GET"})))
+        self.session.mount("https://", adapter)
         self.session.headers.update({
             "Accept": "application/json",
             "User-Agent": "RadheStockMarketPredictor/2.0",
@@ -178,10 +183,44 @@ class UpstoxClient:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(IST)
         return df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
+    @staticmethod
+    def _aggregate_minutes(df: pd.DataFrame, interval: int) -> pd.DataFrame:
+        if df.empty or interval <= 1:
+            return df.copy()
+        data = df.copy().sort_values("timestamp")
+        ts = pd.to_datetime(data["timestamp"], utc=False).dt.tz_convert(IST)
+        mins = ts.dt.hour * 60 + ts.dt.minute
+        # Indian cash-market session: 09:15 through 15:30 IST. Ignore auction/after-close noise.
+        keep = (mins >= MARKET_OPEN_MINUTES) & (mins < MARKET_CLOSE_MINUTES)
+        data = data.loc[keep].copy()
+        if data.empty:
+            return data
+        ts = pd.to_datetime(data["timestamp"], utc=False).dt.tz_convert(IST)
+        session_open = ts.dt.normalize() + pd.Timedelta(minutes=MARKET_OPEN_MINUTES)
+        delta = ((ts - session_open).dt.total_seconds() // 60).astype(int)
+        data["bucket"] = session_open + pd.to_timedelta((delta // int(interval)) * int(interval), unit="m")
+        grouped = data.groupby("bucket", sort=True)
+        out = grouped.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum")).reset_index().rename(columns={"bucket":"timestamp"})
+        out["oi"] = 0.0
+        return out[["timestamp","open","high","low","close","volume","oi"]]
+
     def get_intraday(self, instrument_key: str, interval: int) -> pd.DataFrame:
-        url = f"{UPSTOX_API}/v3/historical-candle/intraday/{instrument_key}/minutes/{int(interval)}"
-        payload = self._get_json(url)
-        return self._to_df(payload.get("data", {}).get("candles", []))
+        encoded = quote(instrument_key, safe="")
+        try:
+            url = f"{UPSTOX_API}/v3/historical-candle/intraday/{encoded}/minutes/{int(interval)}"
+            payload = self._get_json(url)
+            df = self._to_df(payload.get("data", {}).get("candles", []))
+        except UpstoxError:
+            df = pd.DataFrame()
+        if not df.empty:
+            return self._aggregate_minutes(df, interval)
+        if interval != 1:
+            # V3 supports custom intervals, but a 1-minute fallback is more resilient for indices.
+            url = f"{UPSTOX_API}/v3/historical-candle/intraday/{encoded}/minutes/1"
+            payload = self._get_json(url)
+            base = self._to_df(payload.get("data", {}).get("candles", []))
+            return self._aggregate_minutes(base, interval)
+        return df
 
     def get_historical(self, instrument_key: str, interval: int, from_date: date, to_date: date) -> pd.DataFrame:
         # V3 allows a maximum of one month for 1-15 minute candles and one quarter for larger minute intervals.
@@ -193,7 +232,8 @@ class UpstoxClient:
         current_to = to_date
         while current_to >= from_date:
             current_from = max(from_date, current_to - timedelta(days=max_days - 1))
-            url = f"{UPSTOX_API}/v3/historical-candle/{instrument_key}/minutes/{int(interval)}/{current_to.isoformat()}/{current_from.isoformat()}"
+            encoded = quote(instrument_key, safe="")
+            url = f"{UPSTOX_API}/v3/historical-candle/{encoded}/minutes/{int(interval)}/{current_to.isoformat()}/{current_from.isoformat()}"
             payload = self._get_json(url)
             frames.append(self._to_df(payload.get("data", {}).get("candles", [])))
             if current_from <= from_date:
@@ -207,7 +247,17 @@ class UpstoxClient:
         now = datetime.now(ZoneInfo(IST))
         to_date = now.date()
         from_date = to_date - timedelta(days=calendar_days)
-        return self.get_historical(instrument_key, interval, from_date, to_date)
+        try:
+            direct = self.get_historical(instrument_key, interval, from_date, to_date)
+        except UpstoxError:
+            direct = pd.DataFrame()
+        if not direct.empty:
+            return self._aggregate_minutes(direct, interval)
+        if interval != 1:
+            # Fallback to 1-minute history and build the requested timeframe locally.
+            base = self.get_historical(instrument_key, 1, from_date, to_date)
+            return self._aggregate_minutes(base, interval)
+        return direct
 
     def get_quote_batch(self, instrument_keys: Iterable[str]) -> dict:
         keys = list(dict.fromkeys(instrument_keys))
@@ -396,8 +446,19 @@ class LiveMarketHub:
             if ltt is None:
                 ltt = int(time.time() * 1000)
             trade_ts = datetime.fromtimestamp(ltt / 1000.0, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST))
+            now_ist = datetime.now(ZoneInfo(IST))
             if trade_ts.year < 2020:
-                trade_ts = datetime.now(ZoneInfo(IST))
+                return
+            minute_of_day = trade_ts.hour * 60 + trade_ts.minute
+            # Ignore heartbeats/late packets outside the NSE/BSE cash session when building candles.
+            if trade_ts.weekday() >= 5 or minute_of_day < MARKET_OPEN_MINUTES or minute_of_day >= MARKET_CLOSE_MINUTES:
+                with self._lock:
+                    self._latest[key] = {
+                        "price": ltp, "previous_close": cp, "trade_time": trade_ts.isoformat(),
+                        "updated_at": now_ist.isoformat(), "volume": self._as_float(ff.get("vtt")),
+                        "ltq": ltq, "instrument_key": key, "session_trade": False,
+                    }
+                return
 
             # First consume the authoritative 1-minute OHLC snapshot if present.
             market_ohlc = ff.get("marketOHLC") or feed.get("marketOHLC") or {}
@@ -430,9 +491,11 @@ class LiveMarketHub:
                     "price": ltp,
                     "previous_close": cp,
                     "trade_time": trade_ts.isoformat(),
-                    "updated_at": datetime.now(ZoneInfo(IST)).isoformat(),
+                    "updated_at": now_ist.isoformat(),
                     "volume": self._as_float(ff.get("vtt")),
                     "ltq": ltq,
+                    "instrument_key": key,
+                    "session_trade": True,
                 }
 
     def latest(self, instrument_key: str) -> dict | None:
@@ -454,14 +517,16 @@ class LiveMarketHub:
         one = self.one_minute_bars(instrument_key)
         if one.empty:
             return one
-        def bucket(ts: pd.Timestamp) -> pd.Timestamp:
-            session_open = ts.normalize() + pd.Timedelta(minutes=MARKET_OPEN_MINUTES)
-            if ts < session_open:
-                return ts.floor(f"{interval}min")
-            delta_min = int((ts - session_open).total_seconds() // 60)
-            return session_open + pd.Timedelta(minutes=(delta_min // interval) * interval)
         one = one.copy()
-        one["bucket"] = one["timestamp"].map(bucket)
+        ts = pd.to_datetime(one["timestamp"], utc=False).dt.tz_convert(IST)
+        mins = ts.dt.hour * 60 + ts.dt.minute
+        one = one.loc[(mins >= MARKET_OPEN_MINUTES) & (mins < MARKET_CLOSE_MINUTES)].copy()
+        if one.empty:
+            return one
+        ts = pd.to_datetime(one["timestamp"], utc=False).dt.tz_convert(IST)
+        session_open = ts.dt.normalize() + pd.Timedelta(minutes=MARKET_OPEN_MINUTES)
+        delta_min = ((ts - session_open).dt.total_seconds() // 60).astype(int)
+        one["bucket"] = session_open + pd.to_timedelta((delta_min // int(interval)) * int(interval), unit="m")
         grouped = one.groupby("bucket", sort=True)
         out = grouped.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum")).reset_index().rename(columns={"bucket":"timestamp"})
         out["oi"] = 0.0
