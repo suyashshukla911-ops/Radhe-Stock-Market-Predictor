@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from app.config import IST, settings
 from app.data.toi import TOIBackground
+from app.data.moneycontrol import MoneyControlBackground
 
 POS = {"beat","beats","growth","profit","profits","surge","rally","rise","rises","rising","gain","gains","strong","upgrade","upgraded","outperform","record","boost","approval","approved","contract","deal","partnership","launch","expansion","demand","recovery","acquire","acquisition","buyback","dividend","order","orders","guidance","optimistic","bullish","breakout","upside"}
 NEG = {"miss","missed","loss","losses","fall","falls","drop","drops","decline","declined","plunge","plunged","crash","down","weak","downgrade","downgraded","underperform","lawsuit","investigation","fraud","scandal","default","debt","warning","penalty","fine","layoff","delay","recall","probe","resign","resignation","cut","cuts","regulatory","ban","strike","slump","concern","bearish","selloff","breakdown","downside"}
@@ -131,6 +132,7 @@ class NewsService:
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float,list[dict]]] = {}
         self._toi = TOIBackground(settings.toi_refresh_minutes, state_dir=state_dir)
+        self._moneycontrol = MoneyControlBackground(settings.moneycontrol_refresh_minutes, state_dir=state_dir)
         self._x_cache: tuple[float,list[dict]] | None = None
         self.quota = NewsQuota(datetime.now(ZoneInfo(IST)).strftime("%Y-%m-%d"))
         self.last_api_error = ""
@@ -142,6 +144,7 @@ class NewsService:
         if self.started: return
         self.started = True
         self._toi.start()
+        self._moneycontrol.start()
         self.thread = threading.Thread(target=self._loop, name="news-refresh", daemon=True)
         self.thread.start()
 
@@ -267,6 +270,15 @@ class NewsService:
                 row["sentiment"]=tone; row["event"]=event; row["impact"]=round(tone*ew*SOURCE_WEIGHTS["times of india"],4)
             combined.append(row)
 
+        mc = self._moneycontrol.get()
+        if mc:
+            for row in mc.headlines[:30]:
+                row = dict(row)
+                tone=lexical_sentiment(row.get("title","")); event,ew=classify_event(row.get("title",""))
+                row["source"]="Moneycontrol"; row["sentiment"]=tone; row["event"]=event; row["impact"]=round(tone*ew*SOURCE_WEIGHTS["moneycontrol"],4)
+                row["relevance"]=relevance_score(row.get("title",""),symbol,company,"")
+                combined.append(row)
+
         with self._lock:
             if self._x_cache:
                 combined.extend([dict(x) for x in self._x_cache[1]])
@@ -374,4 +386,7 @@ class NewsService:
             "toi_sections_total":toi.sections_total if toi else 18,
             "next_news_refresh_minutes":settings.news_refresh_minutes,
             "next_toi_refresh_minutes":settings.toi_refresh_minutes,
+            "moneycontrol_fetched_at":self._moneycontrol.get().fetched_at if self._moneycontrol.get() else None,
+            "moneycontrol_error":self._moneycontrol.get().error if self._moneycontrol.get() else "",
+            "next_moneycontrol_refresh_minutes":settings.moneycontrol_refresh_minutes,
         }

@@ -13,6 +13,7 @@ from app.config import PRIORITY_STOCKS, settings
 from app.data.news import NewsService
 from app.data.upstox import LiveMarketHub, UpstoxClient, UpstoxError
 from app.services.engine import AnalysisEngine
+from app.services.stock_forecast import StockForecastService
 
 BASE_DIR=Path(__file__).resolve().parents[1]
 FRONTEND_DIR=BASE_DIR/"frontend"
@@ -24,6 +25,7 @@ upstox=UpstoxClient(settings.upstox_access_token,cache_dir=str(BASE_DIR/"data_ca
 live=LiveMarketHub(upstox)
 news=NewsService(settings.news_api_key,max_records=20,state_dir=str(BASE_DIR/"data_cache"))
 engine=AnalysisEngine(upstox,live,news)
+stock_forecaster=StockForecastService(upstox,news)
 oauth_states:set[str]=set()
 
 @app.on_event("startup")
@@ -47,6 +49,7 @@ def health():
         "prediction_refresh_seconds":settings.prediction_refresh_seconds,
         "model_retrain_minutes":settings.model_retrain_minutes,
         "toi_refresh_minutes":settings.toi_refresh_minutes,
+        "moneycontrol_refresh_minutes":settings.moneycontrol_refresh_minutes,
     }
 
 @app.get("/api/priority")
@@ -133,10 +136,28 @@ def analyze(symbol:str=Query(...,min_length=1,max_length=100),interval:str=Query
         raise HTTPException(422,"Prediction timeframes: 1m, 5m, 10m, 15m, 30m and 60m. Use 1D for previous-session history.")
     try:
         ins=upstox.resolve_symbol(symbol)
+        if not ins.segment.endswith("INDEX") and ins.trading_symbol.upper() not in {"SENSEX","NIFTY 50"}:
+            raise HTTPException(422,"Intraday model dashboard is reserved for SENSEX and NIFTY 50. Use the next-session stock forecast for listed equities.")
         return engine.analyze(ins,interval=int(interval),force_retrain=retrain)
     except UpstoxError as exc: raise HTTPException(503,str(exc))
     except ValueError as exc: raise HTTPException(422,str(exc))
     except Exception as exc: raise HTTPException(500,f"Analysis failed: {exc}")
+
+@app.get("/api/stock-forecast")
+def stock_forecast(symbol: str = Query(..., min_length=1, max_length=100), retrain: bool=False):
+    try:
+        ins=upstox.resolve_symbol(symbol)
+        if ins.segment.endswith("INDEX"):
+            raise HTTPException(422,"Use the Sensex/Nifty intraday dashboards for index trading. Stock forecast is for listed equities.")
+        return stock_forecaster.forecast(ins, force=retrain)
+    except UpstoxError as exc:
+        raise HTTPException(503,str(exc))
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500,f"Stock forecast failed: {exc}")
 
 @app.get("/api/live")
 def live_state(symbol:str=Query(...,min_length=1,max_length=100),interval:str=Query("5")):
@@ -207,5 +228,6 @@ def config():
         "model_retrain_minutes":settings.model_retrain_minutes,
         "news_refresh_minutes":settings.news_refresh_minutes,
         "toi_refresh_minutes":settings.toi_refresh_minutes,
+        "moneycontrol_refresh_minutes":settings.moneycontrol_refresh_minutes,
         "supports":{"timeframes":["1","5","10","15","30","60","1d"]},
     }

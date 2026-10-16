@@ -65,6 +65,7 @@ class Settings:
     toi_refresh_minutes: int
     x_refresh_minutes: int
     x_bearer_token: str
+    moneycontrol_refresh_minutes: int
 
     live_poll_seconds: int
     prediction_refresh_seconds: int
@@ -95,6 +96,7 @@ class Settings:
             toi_refresh_minutes=int(os.getenv("TOI_REFRESH_MINUTES", "10")),
             x_refresh_minutes=int(os.getenv("X_REFRESH_MINUTES", "30")),
             x_bearer_token=os.getenv("X_BEARER_TOKEN", "").strip(),
+            moneycontrol_refresh_minutes=int(os.getenv("MONEYCONTROL_REFRESH_MINUTES", "30")),
             live_poll_seconds=int(os.getenv("LIVE_POLL_SECONDS", "60")),
             prediction_refresh_seconds=int(os.getenv("PREDICTION_REFRESH_SECONDS", "300")),
             watch_refresh_seconds=int(os.getenv("WATCH_REFRESH_SECONDS", "300")),

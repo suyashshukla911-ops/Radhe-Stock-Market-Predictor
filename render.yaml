@@ -31,12 +31,14 @@ services:
         value: "10"
       - key: X_REFRESH_MINUTES
         value: "30"
+      - key: MONEYCONTROL_REFRESH_MINUTES
+        value: "30"
       - key: X_BEARER_TOKEN
         sync: false
       - key: LIVE_POLL_SECONDS
-        value: "60"
+        value: "5"
       - key: PREDICTION_REFRESH_SECONDS
-        value: "300"
+        value: "20"
       - key: WATCH_REFRESH_SECONDS
         value: "300"
       - key: MODEL_RETRAIN_MINUTES
