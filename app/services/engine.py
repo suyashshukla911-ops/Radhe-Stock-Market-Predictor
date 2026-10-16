@@ -100,13 +100,27 @@ class AnalysisEngine:
         ws=pd.DataFrame()
         try: ws=self.live.live_bars(instrument.instrument_key,1)
         except Exception: pass
-        cached=self._live_view_cache.get(key)
-        cached_age=(time.time()-cached[0]) if cached else 999999
+
+        # Keep a separate REST backfill cache. The previous implementation
+        # timestamped the *final* merged view on every browser poll, which made
+        # its 60-second REST TTL effectively never expire while the websocket
+        # was active. That left the chart with only the candles accumulated
+        # since the server started.
+        rest_cached=self._rest_live_cache.get(instrument.instrument_key)
+        rest_age=(time.time()-rest_cached[0]) if rest_cached else 999999
         rest=pd.DataFrame()
-        if (not open_now) or cached is None or cached_age>=ttl or ws.empty:
-            try: rest=self.upstox.get_intraday(instrument.instrument_key,1)
-            except Exception: pass
+        if (not rest_cached) or rest_age>=ttl or ws.empty:
+            try:
+                rest=self.upstox.get_intraday(instrument.instrument_key,1)
+                if not rest.empty:
+                    self._rest_live_cache[instrument.instrument_key]=(time.time(),rest.copy())
+            except Exception:
+                rest=rest_cached[1].copy() if rest_cached else pd.DataFrame()
+        elif rest_cached:
+            rest=rest_cached[1].copy()
+
         parts=[x for x in [rest,ws] if not x.empty]
+        cached=self._live_view_cache.get(key)
         if not parts and cached:
             return cached[1].copy()
         if not parts:
