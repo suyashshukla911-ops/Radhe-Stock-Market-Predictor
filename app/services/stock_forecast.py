@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingClassifier
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.metrics import accuracy_score
 
 from app.config import IST, settings
@@ -55,6 +55,13 @@ class StockForecastService:
         d["volume_z"]=((d.volume-vm)/vs).fillna(0.0)
         return d.replace([np.inf,-np.inf],np.nan)
 
+    @staticmethod
+    def _next_trading_session(date_value):
+        d = date_value + timedelta(days=1)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d
+
     def forecast(self, instrument: Instrument, force: bool=False) -> dict:
         key=instrument.instrument_key
         cached=self.cache.get(key)
@@ -97,4 +104,5 @@ class StockForecastService:
             news_impact=impact, training_rows=len(train), generated_at=datetime.now(ZoneInfo(IST)).isoformat()
         )
         self.cache[key]=(datetime.now(ZoneInfo(IST)).timestamp(),forecast)
-        return forecast.__dict__ | {"validation_accuracy":round(accuracy*100,2)}
+        next_session = self._next_trading_session(datetime.now(ZoneInfo(IST)).date())
+        return forecast.__dict__ | {"validation_accuracy":round(accuracy*100,2), "next_session_date": next_session.isoformat()}
