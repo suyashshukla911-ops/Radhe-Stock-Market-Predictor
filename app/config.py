@@ -13,6 +13,13 @@ IST = "Asia/Kolkata"
 MARKET_OPEN_MINUTES = 9 * 60 + 15
 MARKET_CLOSE_MINUTES = 15 * 60 + 30
 
+# NSE cash-market weekday holidays, 2026 (verify yearly against the NSE circular).
+NSE_HOLIDAYS_SET = {
+    "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03",
+    "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", "2026-09-14",
+    "2026-10-02", "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25",
+}
+
 PRIORITY_STOCKS = [
     {"name": "SENSEX", "symbol": "SENSEX", "aliases": ["SENSEX", "BSE SENSEX"]},
     {"name": "NIFTY 50", "symbol": "NIFTY 50", "aliases": ["NIFTY 50", "NIFTY", "NSE NIFTY"]},
@@ -28,7 +35,8 @@ PRIORITY_STOCKS = [
     {"name": "ITC", "symbol": "ITC", "aliases": ["ITC"]},
     {"name": "Larsen & Toubro", "symbol": "LT", "aliases": ["LT", "LARSEN"]},
     {"name": "Axis Bank", "symbol": "AXISBANK", "aliases": ["AXIS BANK", "AXISBANK"]},
-    {"name": "Tata Motors", "symbol": "TATAMOTORS", "aliases": ["TATA MOTORS", "TATAMOTORS"]},
+    {"name": "Tata Motors Passenger Vehicles", "symbol": "TMPV", "aliases": ["TMPV", "TATA MOTORS PASSENGER VEHICLES"]},
+    {"name": "Tata Motors (Commercial Vehicles)", "symbol": "TMCV", "aliases": ["TMCV"]},
     {"name": "Adani Enterprises", "symbol": "ADANIENT", "aliases": ["ADANI ENTERPRISES", "ADANIENT"]},
     {"name": "Sun Pharma", "symbol": "SUNPHARMA", "aliases": ["SUN PHARMA", "SUNPHARMA"]},
     {"name": "Wipro", "symbol": "WIPRO", "aliases": ["WIPRO"]},
@@ -38,6 +46,7 @@ SECTOR_BY_SYMBOL = {
     "RELIANCE": "Energy / Telecom", "TCS": "IT", "INFY": "IT", "HDFCBANK": "Banking",
     "ICICIBANK": "Banking", "SBIN": "Banking", "BHARTIARTL": "Telecom", "ITC": "FMCG",
     "LT": "Infrastructure", "AXISBANK": "Banking", "TATAMOTORS": "Automotive",
+    "TMPV": "Automotive", "TMCV": "Automotive",
     "ADANIENT": "Conglomerate", "SUNPHARMA": "Pharma", "WIPRO": "IT",
 }
 
@@ -82,7 +91,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
-            app_name=os.getenv("APP_NAME", "Radhe Stock Market Predictor"),
+            app_name=os.getenv("APP_NAME", "Suyash Stock Market Predictor"),
             base_url=os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/"),
             upstox_access_token=os.getenv("UPSTOX_ACCESS_TOKEN", "").strip(),
             upstox_client_id=os.getenv("UPSTOX_CLIENT_ID", "").strip(),
@@ -97,8 +106,8 @@ class Settings:
             x_refresh_minutes=int(os.getenv("X_REFRESH_MINUTES", "30")),
             x_bearer_token=os.getenv("X_BEARER_TOKEN", "").strip(),
             moneycontrol_refresh_minutes=int(os.getenv("MONEYCONTROL_REFRESH_MINUTES", "30")),
-            live_poll_seconds=int(os.getenv("LIVE_POLL_SECONDS", "60")),
-            prediction_refresh_seconds=int(os.getenv("PREDICTION_REFRESH_SECONDS", "300")),
+            live_poll_seconds=int(os.getenv("LIVE_POLL_SECONDS", "5")),
+            prediction_refresh_seconds=int(os.getenv("PREDICTION_REFRESH_SECONDS", "20")),
             watch_refresh_seconds=int(os.getenv("WATCH_REFRESH_SECONDS", "300")),
             model_retrain_minutes=int(os.getenv("MODEL_RETRAIN_MINUTES", "30")),
             train_days_short=int(os.getenv("TRAIN_DAYS_SHORT", "30")),

@@ -18,7 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from app.config import INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES
+from app.config import INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES, NSE_HOLIDAYS_SET
 
 try:
     import upstox_client
@@ -57,7 +57,7 @@ class UpstoxClient:
         )
         adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retry)
         self.session.mount("https://", adapter)
-        self.session.headers.update({"Accept": "application/json", "User-Agent": "RadheStockMarketPredictor/3.0"})
+        self.session.headers.update({"Accept": "application/json", "User-Agent": "SuyashStockMarketPredictor/3.0"})
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._instruments: list[Instrument] | None = None
@@ -127,9 +127,27 @@ class UpstoxClient:
             unique[item.instrument_key] = item
         return list(unique.values())
 
+    @staticmethod
+    def is_market_open(dt: Optional[datetime] = None) -> bool:
+        if dt is None:
+            dt = datetime.now(ZoneInfo(IST))
+        elif dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(IST))
+        else:
+            dt = dt.astimezone(ZoneInfo(IST))
+        if dt.weekday() >= 5:
+            return False
+        date_str = dt.strftime("%Y-%m-%d")
+        if date_str in NSE_HOLIDAYS_SET:
+            return False
+        minute = dt.hour * 60 + dt.minute
+        return MARKET_OPEN_MINUTES <= minute < MARKET_CLOSE_MINUTES
+
     def load_instruments(self, force: bool = False) -> list[Instrument]:
-        cache_file = self.cache_dir / "instruments_equity.json"
         with self._lock:
+            if not force and self._instruments is not None:
+                return self._instruments
+            cache_file = self.cache_dir / "instruments_equity.json"
             if not force and cache_file.exists() and time.time() - cache_file.stat().st_mtime < 12 * 3600:
                 try:
                     raw = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -138,7 +156,10 @@ class UpstoxClient:
                 except Exception:
                     pass
             rows = self._download_instruments()
-            cache_file.write_text(json.dumps([x.__dict__ for x in rows], ensure_ascii=False), encoding="utf-8")
+            try:
+                cache_file.write_text(json.dumps([x.__dict__ for x in rows], ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
             self._instruments = rows
             return rows
 
@@ -170,7 +191,7 @@ class UpstoxClient:
                 exact.append(ins)
             elif any(q in field for field in fields):
                 fuzzy.append(ins)
-        exact.sort(key=lambda x: (x.exchange, x.trading_symbol))
+        exact.sort(key=lambda x: (0 if x.exchange == "NSE" else 1, x.trading_symbol))
         fuzzy.sort(key=lambda x: (0 if x.exchange == "NSE" else 1, x.trading_symbol))
         return (exact + fuzzy)[:limit]
 
@@ -213,7 +234,7 @@ class UpstoxClient:
         if data.empty:
             return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
         ts = pd.to_datetime(data["timestamp"], utc=False).dt.tz_convert(IST)
-        session_open = ts.dt.normalize() + pd.Timedelta(minutes=MARKET_OPEN_MINUTES)
+        session_open = ts.dt.normalize() + pd.to_timedelta(MARKET_OPEN_MINUTES, unit="m")
         elapsed = ((ts - session_open).dt.total_seconds() // 60).astype(int)
         bucket = (elapsed // max(1, int(interval))) * max(1, int(interval))
         data["timestamp"] = session_open + pd.to_timedelta(bucket, unit="m")
@@ -252,7 +273,8 @@ class UpstoxClient:
             try:
                 payload = self._get_json(url)
             except UpstoxError:
-                if current_from == from_date:
+                # only tolerate failures on very old chunks; recent holes would corrupt features
+                if current_from == from_date or (to_date - current_to).days < 60:
                     raise
                 current_to = current_from - timedelta(days=1)
                 continue
@@ -307,6 +329,7 @@ class LiveMarketHub:
         self._started = False
         self._connected = False
         self._requested: set[str] = set()
+        self._minute_bars: dict[str, dict[datetime, dict]] = {}
         self._minutes: dict[str, deque[dict]] = {}
         self._current: dict[str, dict] = {}
         self._latest_session: dict[str, dict] = {}
@@ -398,25 +421,48 @@ class LiveMarketHub:
         try: return int(float(v))
         except Exception: return None
 
-    def _upsert(self, key: str, bar: dict):
+    def _upsert(self, key: str, bar: dict, is_authoritative: bool = False):
         ts = pd.Timestamp(bar["timestamp"])
         if ts.tz is None: ts = ts.tz_localize(IST)
         else: ts = ts.tz_convert(IST)
-        ts = ts.floor("min")
-        row = {"timestamp": ts.to_pydatetime(), "open": float(bar["open"]), "high": float(bar["high"]),
-               "low": float(bar["low"]), "close": float(bar["close"]), "volume": float(bar.get("volume") or 0.0)}
+        minute_ts = ts.floor("min").to_pydatetime()
+        op = float(bar["open"])
+        hi = float(bar["high"])
+        lo = float(bar["low"])
+        cl = float(bar["close"])
+        vol = float(bar.get("volume") or 0.0)
+
         with self._lock:
-            current = self._current.get(key)
-            if current is None or current["timestamp"] != row["timestamp"]:
-                if current is not None:
-                    self._minutes.setdefault(key, deque(maxlen=8000)).append(dict(current))
-                self._current[key] = row
-                return
-            current["open"] = float(current["open"])
-            current["high"] = max(float(current["high"]), row["high"])
-            current["low"] = min(float(current["low"]), row["low"])
-            current["close"] = row["close"]
-            current["volume"] = max(float(current.get("volume", 0.0)), row["volume"])
+            bars = self._minute_bars.setdefault(key, {})
+            existing = bars.get(minute_ts)
+            if existing is None:
+                bars[minute_ts] = {
+                    "timestamp": minute_ts,
+                    "open": op, "high": hi, "low": lo, "close": cl,
+                    "volume": vol, "is_feed": is_authoritative,
+                }
+            else:
+                if is_authoritative:
+                    existing["open"] = op
+                    existing["high"] = max(existing["high"], hi)
+                    existing["low"] = min(existing["low"], lo)
+                    existing["close"] = cl
+                    existing["volume"] = max(existing.get("volume", 0.0), vol)
+                    existing["is_feed"] = True
+                else:
+                    existing["high"] = max(existing["high"], hi)
+                    existing["low"] = min(existing["low"], lo)
+                    existing["close"] = cl
+
+            if len(bars) > 6000:
+                oldest = sorted(bars.keys())[:1000]
+                for old in oldest:
+                    del bars[old]
+
+            sorted_items = sorted(bars.values(), key=lambda r: r["timestamp"])
+            if sorted_items:
+                self._current[key] = dict(sorted_items[-1])
+                self._minutes[key] = deque([dict(x) for x in sorted_items[:-1]], maxlen=8000)
 
     def _ingest(self, message: dict):
         if not isinstance(message, dict): return
@@ -447,9 +493,11 @@ class LiveMarketHub:
                 op = self._float(candle.get("open")); hi = self._float(candle.get("high"))
                 lo = self._float(candle.get("low")); cl = self._float(candle.get("close"))
                 if None in (ts, op, hi, lo, cl): continue
-                self._upsert(key, {"timestamp": datetime.fromtimestamp(ts/1000, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST)),
-                                    "open":op,"high":hi,"low":lo,"close":cl,"volume":self._float(candle.get("vol")) or 0.0})
-            self._upsert(key, {"timestamp":trade_ts,"open":ltp,"high":ltp,"low":ltp,"close":ltp,"volume":0.0})
+                self._upsert(key, {
+                    "timestamp": datetime.fromtimestamp(ts/1000, tz=ZoneInfo("UTC")).astimezone(ZoneInfo(IST)),
+                    "open": op, "high": hi, "low": lo, "close": cl, "volume": self._float(candle.get("vol")) or 0.0
+                }, is_authoritative=True)
+            self._upsert(key, {"timestamp": trade_ts, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": 0.0}, is_authoritative=False)
             with self._lock:
                 self._latest_session[key] = {
                     "price": ltp, "previous_close": cp, "trade_time": trade_ts.isoformat(),
@@ -462,15 +510,21 @@ class LiveMarketHub:
 
     def live_bars(self, key: str, interval: int = 1):
         with self._lock:
-            rows = list(self._minutes.get(key, ()))
-            current = self._current.get(key)
-            if current is not None: rows.append(dict(current))
+            bars = self._minute_bars.get(key)
+            if not bars:
+                rows = list(self._minutes.get(key, ()))
+                current = self._current.get(key)
+                if current is not None: rows.append(dict(current))
+            else:
+                rows = sorted(bars.values(), key=lambda r: r["timestamp"])
         if not rows: return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
         df = pd.DataFrame(rows)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False).dt.tz_convert(IST)
         df["oi"] = 0.0
-        if interval == 1: return df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
-        return UpstoxClient.aggregate_minutes(df, interval)
+        cols = ["timestamp","open","high","low","close","volume","oi"]
+        clean_df = df[[c for c in cols if c in df.columns]].copy()
+        if interval == 1: return clean_df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+        return UpstoxClient.aggregate_minutes(clean_df, interval)
 
     def latest_or_rest(self, key: str, interval: int):
         tick = self.latest(key)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -28,27 +29,36 @@ class AnalysisEngine:
         self.upstox=upstox; self.live=live; self.news=news
         self.models={}; self.last_results={}
         self._history_cache={}; self._context_cache={}; self._live_view_cache={}
+        self._rest_live_cache={}
+        self._training=set(); self._train_guard=threading.Lock(); self._train_error={}
         self._eod_cache={}; self._morning_cache={}
         self._analysis_lock=threading.RLock()
-        self._session_state_file=Path('data_cache')/'eod_outlook.json'
+        cache_dir=Path(os.getenv("CACHE_DIR") or os.getenv("DATA_DIR") or "data_cache")
+        self._session_state_file=cache_dir/'eod_outlook.json'
         self._session_state_file.parent.mkdir(parents=True,exist_ok=True)
-        self._load_state()
+        self._load_session_state()
 
-    def _load_state(self):
+    def _load_session_state(self):
         try:
+            cutoff=(datetime.now(ZoneInfo(IST)).date() - timedelta(days=7)).isoformat()
             obj=json.loads(self._session_state_file.read_text(encoding='utf-8'))
-            self._eod_cache.update(obj.get('eod',{})); self._morning_cache.update(obj.get('morning',{}))
+            self._eod_cache.update({k: v for k, v in obj.get('eod',{}).items() if k.split('|')[-1] >= cutoff})
+            self._morning_cache.update({k: v for k, v in obj.get('morning',{}).items() if k.split('|')[-1] >= cutoff})
         except Exception: pass
+    _load_state = _load_session_state
 
-    def _save_state(self):
+    def _save_session_state(self):
         try:
-            self._session_state_file.write_text(json.dumps({'eod':self._eod_cache,'morning':self._morning_cache},ensure_ascii=False),encoding='utf-8')
+            cutoff=(datetime.now(ZoneInfo(IST)).date() - timedelta(days=7)).isoformat()
+            eod_pruned={k: v for k, v in self._eod_cache.items() if k.split('|')[-1] >= cutoff}
+            morning_pruned={k: v for k, v in self._morning_cache.items() if k.split('|')[-1] >= cutoff}
+            self._session_state_file.write_text(json.dumps({'eod':eod_pruned,'morning':morning_pruned},ensure_ascii=False),encoding='utf-8')
         except Exception: pass
+    _save_state = _save_session_state
 
     @staticmethod
     def _market_open():
-        n=datetime.now(ZoneInfo(IST)); m=n.hour*60+n.minute
-        return n.weekday()<5 and 9*60+15<=m<15*60+30
+        return UpstoxClient.is_market_open()
 
     @staticmethod
     def _today(): return str(datetime.now(ZoneInfo(IST)).date())
@@ -87,12 +97,41 @@ class AnalysisEngine:
         cutoff=datetime.now(ZoneInfo(IST)).date()
         history_train=history.loc[history['timestamp'].dt.date<cutoff].copy()
         context=self._get_context_history(int(interval),self._history_window(int(interval)),force=force)
-        context_train={k:v.loc[v['timestamp'].dt.date<cutoff].copy() for k,v in context.items()}
+        context_train={}
+        for k in ('nifty','banknifty','vix'):
+            v=context.get(k)
+            context_train[k]=(v.loc[v['timestamp'].dt.date<cutoff].copy()
+                              if v is not None and not v.empty and 'timestamp' in v.columns else pd.DataFrame())
         train=prepare_training_frame(history_train,context=context_train)
         if len(train)<settings.min_train_rows:
             raise ValueError(f'Not enough clean training rows for {instrument.trading_symbol} at {interval}m: raw={len(history_train)}, clean={len(train)}, need={settings.min_train_rows}.')
         model=CandleModel(settings.min_train_rows); model.fit(train,FEATURES)
         cache=ModelCache(model,time.time(),history_train,context_train); self.models[key]=cache; return cache
+
+    def _retrain_async(self,instrument,interval):
+        key=(instrument.instrument_key,int(interval))
+        with self._train_guard:
+            if key in self._training: return
+            self._training.add(key)
+        def run():
+            try:
+                self._get_training_cache(instrument,int(interval),force=True); self._train_error.pop(key,None)
+            except Exception as exc:
+                self._train_error[key]=str(exc)
+            finally:
+                with self._train_guard: self._training.discard(key)
+        threading.Thread(target=run,name=f"train-{key[1]}m",daemon=True).start()
+
+    def _model_for_request(self,instrument,interval,force=False):
+        """Never train inside an HTTP request: serve the cached model and refresh it in the background."""
+        key=(instrument.instrument_key,int(interval)); cached=self.models.get(key)
+        fresh=bool(cached) and time.time()-cached.fitted_at<settings.model_retrain_minutes*60
+        if cached and fresh and not force: return cached
+        self._retrain_async(instrument,interval)
+        if cached: return cached
+        err=self._train_error.pop(key,None)
+        if err: raise ValueError(err)
+        raise ValueError(f'Model for {instrument.trading_symbol} {int(interval)}m is training in the background (about a minute). It will appear automatically.')
 
     def _live_snapshot(self,instrument,interval,ttl_seconds=None):
         ttl=settings.live_rest_cache_seconds if ttl_seconds is None else ttl_seconds
@@ -109,13 +148,18 @@ class AnalysisEngine:
         rest_cached=self._rest_live_cache.get(instrument.instrument_key)
         rest_age=(time.time()-rest_cached[0]) if rest_cached else 999999
         rest=pd.DataFrame()
-        if (not rest_cached) or rest_age>=ttl or ws.empty:
+        if (not rest_cached) or rest_age>=ttl:
             try:
                 rest=self.upstox.get_intraday(instrument.instrument_key,1)
                 if not rest.empty:
                     self._rest_live_cache[instrument.instrument_key]=(time.time(),rest.copy())
+                elif not rest_cached:
+                    self._rest_live_cache[instrument.instrument_key]=(time.time(),pd.DataFrame())
             except Exception:
-                rest=rest_cached[1].copy() if rest_cached else pd.DataFrame()
+                if rest_cached:
+                    rest=rest_cached[1].copy()
+                else:
+                    self._rest_live_cache[instrument.instrument_key]=(time.time(),pd.DataFrame())
         elif rest_cached:
             rest=rest_cached[1].copy()
 
@@ -153,17 +197,22 @@ class AnalysisEngine:
         return pd.concat([h,live],ignore_index=True).sort_values('timestamp').drop_duplicates('timestamp',keep='last').reset_index(drop=True),live
 
     def _forecast_path(self,model_cache,combined,context_live,interval,current_price,news_impact,steps=2):
-        work=combined.copy().sort_values('timestamp').reset_index(drop=True); forecasts=[]
-        for step in range(steps):
-            feat=build_features(work,context=context_live).dropna(subset=FEATURES)
-            if feat.empty: break
-            latest=feat.iloc[[-1]]; px=current_price if step==0 else float(work.close.iloc[-1])
-            pred=model_cache.model.predict(latest,px,news_impact=news_impact)
-            start=pd.Timestamp(work.timestamp.iloc[-1]).tz_convert(IST)+pd.Timedelta(minutes=int(interval))
-            row={'timestamp':start,'open':px,'high':pred['predicted_high'],'low':pred['predicted_low'],'close':pred['predicted_close'],'volume':0.0,'oi':0.0}
-            forecasts.append({'time':start.isoformat(),'open':round(px,4),'high':pred['predicted_high'],'low':pred['predicted_low'],'close':pred['predicted_close'],'step':step+1})
-            work=pd.concat([work,pd.DataFrame([row])],ignore_index=True)
-        return forecasts
+        feat=build_features(combined,context=context_live).dropna(subset=FEATURES)
+        if feat.empty: return []
+        latest=feat.iloc[[-1]]
+        pred=model_cache.model.predict(latest,current_price,news_impact=news_impact)
+        start_time=pd.Timestamp(combined.timestamp.iloc[-1]).tz_convert(IST)
+
+        t1_time=start_time+pd.to_timedelta(int(interval), unit="m")
+        t1_close=pred['predicted_close']
+        f1={'time':t1_time.isoformat(),'open':round(current_price,4),'high':pred['predicted_high'],'low':pred['predicted_low'],'close':t1_close,'step':1}
+
+        t2_time=t1_time+pd.to_timedelta(int(interval), unit="m")
+        t2_close=pred.get('predicted_t2_close', round(t1_close*(1+pred['raw_return']*0.95),4))
+        t2_high=pred.get('predicted_t2_high', round(max(t1_close,t2_close),4))
+        t2_low=pred.get('predicted_t2_low', round(min(t1_close,t2_close),4))
+        f2={'time':t2_time.isoformat(),'open':round(t1_close,4),'high':t2_high,'low':t2_low,'close':t2_close,'step':2}
+        return [f1, f2]
 
     def analyze(self,instrument:Instrument,interval:int,force_retrain=False):
         if not self._market_open(): raise ValueError('Prediction is available only while the Indian cash market is open (09:15–15:30 IST).')
@@ -173,7 +222,7 @@ class AnalysisEngine:
             cached=self.last_results.get(key)
             if cached and not force_retrain and cached.get('session_date')==today and time.time()-cached['_created_at']<settings.prediction_refresh_seconds:
                 return {k:v for k,v in cached.items() if k!='_created_at'}
-            mc=self._get_training_cache(instrument,interval,force=force_retrain); combined,live=self._merge_training_and_live(instrument,interval)
+            mc=self._model_for_request(instrument,interval,force=force_retrain); combined,live=self._merge_training_and_live(instrument,interval)
             if live.empty: raise UpstoxError('Current-session candle snapshot is unavailable. Waiting for the live market feed.')
             context_live={}
             for label,ins in self._resolve_context().items():
@@ -191,22 +240,27 @@ class AnalysisEngine:
                 live_pred['predicted_close']=path[0]['close']; live_pred['predicted_high']=path[0]['high']; live_pred['predicted_low']=path[0]['low']
             eod_key=f'{instrument.instrument_key}|{today}'
             if eod_key not in self._eod_cache:
+                today_date=datetime.now(ZoneInfo(IST)).date()
+                today_bars=live.loc[live.timestamp.dt.date==today_date] if not live.empty else pd.DataFrame()
+                opening_ref=float(today_bars.iloc[0].open) if not today_bars.empty else current_price
                 self._eod_cache[eod_key]={
                     'predicted_eod_close':float(live_pred['predicted_eod_close']),
                     'eod_return':float(live_pred['eod_return']),
-                    'opening_reference_price':current_price,
+                    'opening_reference_price':opening_ref,
                     'news_impact':impact,
                     'created_at':datetime.now(ZoneInfo(IST)).isoformat(),
+                    'late':(datetime.now(ZoneInfo(IST)).hour*60+datetime.now(ZoneInfo(IST)).minute)>11*60,
                 }
                 self._morning_cache[eod_key]={'news_headline_count':news['summary'].get('headline_count',0),'news_impact':impact,'created_at':datetime.now(ZoneInfo(IST)).isoformat()}
                 self._save_session_state()
             eod=self._eod_cache[eod_key]; live_pred['predicted_eod_close']=eod['predicted_eod_close']; live_pred['eod_return']=eod['eod_return']
             rows=[{'time':r.timestamp.isoformat(),'open':float(r.open),'high':float(r.high),'low':float(r.low),'close':float(r.close),'volume':float(r.volume or 0)} for r in live.tail(settings.chart_bars).itertuples()]
             result={
+                'symbol':instrument.trading_symbol,
                 'instrument':{'name':instrument.name,'short_name':instrument.short_name,'symbol':instrument.trading_symbol,'exchange':instrument.exchange,'segment':instrument.segment,'instrument_key':instrument.instrument_key,'sector':SECTOR_BY_SYMBOL.get(instrument.trading_symbol.upper(),'Market Index' if instrument.segment.endswith('INDEX') else 'Unknown')},
                 'interval':int(interval),'session_date':today,'last_timestamp':latest.timestamp.iloc[0].isoformat(),'current_price':current_price,
                 'actual_candles':rows,'forecast_candles':path,'candles':rows,'prediction':live_pred,'news':news,
-                'morning_outlook':{'eod_close':eod['predicted_eod_close'],'change_pct':round((eod['predicted_eod_close']/eod['opening_reference_price']-1)*100,2),'news_impact':eod['news_impact'],'fixed_since':eod['created_at']},
+                'morning_outlook':{'eod_close':eod['predicted_eod_close'],'change_pct':round((eod['predicted_eod_close']/eod['opening_reference_price']-1)*100,2),'news_impact':eod['news_impact'],'fixed_since':eod['created_at'],'late':eod.get('late',False)},
                 'market_state':{'stream_connected':self.live.connected,'stream_error':self.live.last_error,'history_rows':len(mc.history),'training_rows':live_pred['validation']['train_rows'],'live_rows':len(live),'model_cache_age_seconds':round(time.time()-mc.fitted_at,1),'prediction_refresh_seconds':settings.prediction_refresh_seconds,'model_retrain_minutes':settings.model_retrain_minutes,'market_status':'OPEN'},
                 'refresh_policy':{'browser_seconds':settings.live_poll_seconds,'prediction_seconds':settings.prediction_refresh_seconds,'model_retrain_minutes':settings.model_retrain_minutes,'toi_minutes':settings.toi_refresh_minutes,'news_minutes':settings.news_refresh_minutes,'moneycontrol_minutes':settings.moneycontrol_refresh_minutes},
                 '_created_at':time.time()
@@ -230,7 +284,7 @@ class AnalysisEngine:
             except Exception: pass
         if not bars.empty:
             last=bars.iloc[-1]; ts=pd.Timestamp(last.timestamp).tz_convert(IST); tick={'price':float(last.close),'trade_time':ts.isoformat(),'updated_at':ts.isoformat(),'instrument_key':instrument.instrument_key,'session_trade':False}
-            candle={'start':ts.isoformat(),'end':(ts+pd.Timedelta(days=1)).isoformat(),'open':float(last.open),'high':float(last.high),'low':float(last.low),'close':float(last.close),'volume':float(last.volume or 0),'forming':False}
+            candle={'start':ts.isoformat(),'end':(ts+pd.to_timedelta(1, unit="D")).isoformat(),'open':float(last.open),'high':float(last.high),'low':float(last.low),'close':float(last.close),'volume':float(last.volume or 0),'forming':False}
         else: candle=None
         status='OPEN' if self._market_open() else ('WEEKEND' if now.weekday()>=5 else 'CLOSED')
         age=None
@@ -248,7 +302,7 @@ class AnalysisEngine:
             last=bars.iloc[-1]; ts=pd.Timestamp(last.timestamp).tz_convert(IST); tick={'price':float(last.close),'trade_time':ts.isoformat(),'updated_at':ts.isoformat(),'instrument_key':instrument.instrument_key,'session_trade':False}
         current=None; secs=0
         if not bars.empty:
-            row=bars.iloc[-1]; start=pd.Timestamp(row.timestamp).tz_convert(IST); end=min(start+pd.Timedelta(minutes=int(interval)),start.normalize()+pd.Timedelta(minutes=15*60+30)); forming=bool(open_now and start.date()==now.date() and start<=pd.Timestamp(now)<end)
+            row=bars.iloc[-1]; start=pd.Timestamp(row.timestamp).tz_convert(IST); end=min(start+pd.to_timedelta(int(interval), unit="m"),start.normalize()+pd.to_timedelta(15*60+30, unit="m")); forming=bool(open_now and start.date()==now.date() and start<=pd.Timestamp(now)<end)
             current={'start':start.isoformat(),'end':end.isoformat(),'open':float(row.open),'high':float(row.high),'low':float(row.low),'close':float(row.close),'volume':float(row.volume or 0),'forming':forming}
             if forming: secs=max(0,int((end.to_pydatetime()-now).total_seconds()))
         status='OPEN' if open_now else ('WEEKEND' if now.weekday()>=5 else 'CLOSED'); age=None

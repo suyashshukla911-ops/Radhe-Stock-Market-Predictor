@@ -1,4 +1,4 @@
-# Radhe Stock Market Predictor
+# Suyash Stock Market Predictor
 
 Live Indian market dashboard focused on SENSEX and NIFTY 50, with a separate next-session stock forecast workflow.
 

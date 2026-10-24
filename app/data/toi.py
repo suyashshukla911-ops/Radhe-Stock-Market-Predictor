@@ -96,10 +96,15 @@ class TOIScraper:
     def _robots_ok(self, url: str) -> bool:
         if not self._robots_loaded:
             try:
-                self.robots.read()
+                rr = self.session.get(f"{BASE}/robots.txt", timeout=10)
+                if rr.status_code == 200:
+                    self.robots.parse(rr.text.splitlines())
+                elif rr.status_code in (401, 403):
+                    return False
+                else:
+                    self.robots.allow_all = True
                 self._robots_loaded = True
             except Exception:
-                # Fail closed if robots.txt cannot be read.
                 return False
         return self.robots.can_fetch(USER_AGENT, url)
 

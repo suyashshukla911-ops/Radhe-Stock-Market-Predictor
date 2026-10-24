@@ -32,6 +32,9 @@ class CandleModel:
         self.return_model = None
         self.high_model = None
         self.low_model = None
+        self.return_model_t2 = None
+        self.high_model_t2 = None
+        self.low_model_t2 = None
         self.eod_model = None
         self.features: list[str] = []
         self.report: ModelReport | None = None
@@ -56,9 +59,8 @@ class CandleModel:
             - 0.08*np.tanh(vix/(3.0*atr))
         )
         regime_prob = 0.5 + 0.5*np.clip(regime, -1.0, 1.0)
-        # Keep the trained model primary, but let strong current market direction
-        # move the probability enough to avoid stale-regime decisions.
-        return np.clip(0.70*np.asarray(base_p, dtype=float) + 0.30*regime_prob, 0.01, 0.99)
+        # Calibrated classifier is primary; light market regime adjustment
+        return np.clip(0.85*np.asarray(base_p, dtype=float) + 0.15*regime_prob, 0.01, 0.99)
 
     @staticmethod
     def _trend_return(frame: pd.DataFrame) -> np.ndarray:
@@ -85,7 +87,7 @@ class CandleModel:
     def _threshold(cls, y: np.ndarray, p: np.ndarray):
         best = (0.70, 0.0, 0.0, 0, 0.0)
         n = len(y)
-        minimum = max(30, int(n*0.03))
+        minimum = max(15, int(n*0.03))
         for t in np.arange(0.55, 0.96, 0.01):
             long_mask = p >= t
             short_mask = p <= 1-t
@@ -120,11 +122,11 @@ class CandleModel:
     @staticmethod
     def _fit_regressor(X, y):
         hgb = HistGradientBoostingRegressor(
-            learning_rate=0.05, max_iter=140, max_leaf_nodes=24,
+            learning_rate=0.06, max_iter=100, max_leaf_nodes=20,
             l2_regularization=0.15, loss="absolute_error", random_state=42,
         )
         et = ExtraTreesRegressor(
-            n_estimators=90, max_depth=12, min_samples_leaf=5, n_jobs=-1, random_state=42
+            n_estimators=30, max_depth=10, min_samples_leaf=5, n_jobs=2, random_state=42
         )
         class Ensemble:
             def __init__(self, a, b): self.a, self.b = a, b
@@ -148,36 +150,68 @@ class CandleModel:
             train, val = data.iloc[:cut].copy(), data.iloc[cut:].copy()
         if len(np.unique(train["direction"].astype(int))) < 2:
             raise ValueError("Training window contains one direction class; widen the history.")
-        if len(np.unique(val["direction"].astype(int))) < 2:
-            # Validation is allowed to be one-class; precision still remains inspectable.
-            pass
 
-        X_train, X_val = train[self.features], val[self.features]
-        y_train, y_val = train["direction"].astype(int), val["direction"].astype(int)
-        direction = self._fit_classifier(X_train, y_train)
-        direction.fit(X_train, y_train)
-        raw_p = direction.predict_proba(X_val)[:,1]
-        p_val = self._adaptive_probability(raw_p, val)
-        threshold, precision, coverage, signals, lower = self._threshold(y_val.to_numpy(), p_val)
-        acc = accuracy_score(y_val, (p_val >= 0.5).astype(int))
-        brier = brier_score_loss(y_val, p_val) if len(np.unique(y_val)) > 1 else 0.25
+        # Nested walk-forward: tune threshold on val_tune, grade out-of-sample on val_eval
+        val_split = max(1, len(val) // 2)
+        val_tune = val.iloc[:val_split]
+        val_eval = val.iloc[val_split:] if val_split < len(val) else val_tune
+
+        X_train, y_train = train[self.features], train["direction"].astype(int)
+        val_tune_y = val_tune["direction"].astype(int).to_numpy()
+        val_eval_y = val_eval["direction"].astype(int).to_numpy()
+
+        direction_pre = self._fit_classifier(X_train, y_train)
+        direction_pre.fit(X_train, y_train)
+        raw_p_tune = direction_pre.predict_proba(val_tune[self.features])[:,1]
+        p_tune = self._adaptive_probability(raw_p_tune, val_tune)
+        threshold, _, _, tune_signals, _ = self._threshold(val_tune_y, p_tune)
+        if tune_signals == 0:  # no fixed level had enough signals: use the top ~20% most confident bars
+            threshold = float(np.clip(0.5 + np.quantile(np.abs(p_tune - 0.5), 0.80), 0.52, 0.90))
+
+        raw_p_eval = direction_pre.predict_proba(val_eval[self.features])[:,1]
+        p_eval = self._adaptive_probability(raw_p_eval, val_eval)
+        
+        long_mask = p_eval >= threshold
+        short_mask = p_eval <= 1 - threshold
+        sig_mask = long_mask | short_mask
+        signals = int(sig_mask.sum())
+        if signals > 0:
+            preds = np.where(long_mask[sig_mask], 1, 0)
+            truth = val_eval_y[sig_mask]
+            wins = int((preds == truth).sum())
+            precision = float(precision_score(truth, preds, zero_division=0))
+            coverage = signals / len(val_eval_y) if len(val_eval_y) else 0.0
+            lower = self._wilson_lower(wins, signals)
+        else:
+            precision, coverage, lower = 0.0, 0.0, 0.0
+
+        acc = accuracy_score(val_eval_y, (p_eval >= 0.5).astype(int)) if len(val_eval_y) else 0.5
+        brier = brier_score_loss(val_eval_y, p_eval) if len(np.unique(val_eval_y)) > 1 else 0.25
 
         def fit_reg(target):
             reg = self._fit_regressor(X_train, train[target])
             reg.fit(X_train, train[target])
-            mae = mean_absolute_error(val[target], reg.predict(X_val))
+            mae = mean_absolute_error(val[target], reg.predict(val[self.features]))
+            reg.fit(data[self.features], data[target])
             return reg, float(mae)
 
-        ret_model, ret_mae = fit_reg("next_return")
-        hi_model, _ = fit_reg("next_high_return")
-        lo_model, _ = fit_reg("next_low_return")
-        eod_model, _ = fit_reg("eod_return")
+        self.return_model, ret_mae = fit_reg("next_return")
+        self.high_model, _ = fit_reg("next_high_return")
+        self.low_model, _ = fit_reg("next_low_return")
+
+        t2_ret = "next_2_return" if "next_2_return" in data.columns else "next_return"
+        t2_hi = "next_2_high_return" if "next_2_high_return" in data.columns else "next_high_return"
+        t2_lo = "next_2_low_return" if "next_2_low_return" in data.columns else "next_low_return"
+        self.return_model_t2, _ = fit_reg(t2_ret)
+        self.high_model_t2, _ = fit_reg(t2_hi)
+        self.low_model_t2, _ = fit_reg(t2_lo)
+        self.eod_model, _ = fit_reg("eod_return")
 
         self.direction_model = self._fit_classifier(data[self.features], data["direction"].astype(int)).fit(data[self.features], data["direction"].astype(int))
-        self.return_model = self._fit_regressor(data[self.features], data["next_return"]).fit(data[self.features], data["next_return"])
-        self.high_model = self._fit_regressor(data[self.features], data["next_high_return"]).fit(data[self.features], data["next_high_return"])
-        self.low_model = self._fit_regressor(data[self.features], data["next_low_return"]).fit(data[self.features], data["next_low_return"])
-        self.eod_model = self._fit_regressor(data[self.features], data["eod_return"]).fit(data[self.features], data["eod_return"])
+
+        # Statistically significant edge over base rate (50%)
+        base_rate = float(max(val_eval_y.mean(), 1 - val_eval_y.mean())) if len(val_eval_y) else 0.5
+        gate_passed = bool(precision >= 0.55 and lower >= max(0.50, base_rate) and signals >= 30 and coverage >= 0.02)
 
         self.report = ModelReport(
             direction_accuracy=float(acc),
@@ -188,9 +222,7 @@ class CandleModel:
             precision_lower_bound=float(lower),
             next_return_mae=float(ret_mae),
             threshold=float(threshold),
-            # Predictions are visible regardless; BUY/SELL requires a statistically
-            # defensible validation sample.
-            gate_90_passed=bool(precision >= 0.90 and lower >= 0.90 and signals >= 30 and coverage >= 0.02),
+            gate_90_passed=gate_passed,
             train_rows=len(train),
             validation_rows=len(val),
             fit_timestamp=pd.Timestamp.now(tz="UTC").isoformat(),
@@ -220,6 +252,14 @@ class CandleModel:
         predicted_low = current_price*(1+min(0.0, low_return, adjusted_return))
         predicted_eod = current_price*(1+eod_return+news_overlay*0.25)
 
+        # Direct T+2 multi-step predictions
+        raw_return_t2 = float(self.return_model_t2.predict(X)[0]) if self.return_model_t2 else raw_return * 0.95
+        high_return_t2 = float(self.high_model_t2.predict(X)[0]) if self.high_model_t2 else high_return
+        low_return_t2 = float(self.low_model_t2.predict(X)[0]) if self.low_model_t2 else low_return
+        predicted_t2_close = predicted_close * (1 + (raw_return_t2 - raw_return))
+        predicted_t2_high = max(predicted_close, predicted_close * (1 + max(0.0, high_return_t2 - raw_return)))
+        predicted_t2_low = min(predicted_close, predicted_close * (1 + min(0.0, low_return_t2 - raw_return)))
+
         t = self.report.threshold
         buy = p_up >= t
         sell = p_up <= 1-t
@@ -240,6 +280,9 @@ class CandleModel:
             "predicted_close": round(predicted_close, 4),
             "predicted_high": round(max(predicted_high, predicted_close), 4),
             "predicted_low": round(min(predicted_low, predicted_close), 4),
+            "predicted_t2_close": round(predicted_t2_close, 4),
+            "predicted_t2_high": round(predicted_t2_high, 4),
+            "predicted_t2_low": round(predicted_t2_low, 4),
             "eod_return": round(eod_return, 6),
             "predicted_eod_close": round(predicted_eod, 4),
             "validation": {

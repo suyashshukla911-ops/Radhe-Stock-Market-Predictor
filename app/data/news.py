@@ -18,8 +18,62 @@ from app.config import IST, settings
 from app.data.toi import TOIBackground
 from app.data.moneycontrol import MoneyControlBackground
 
-POS = {"beat","beats","growth","profit","profits","surge","rally","rise","rises","rising","gain","gains","strong","upgrade","upgraded","outperform","record","boost","approval","approved","contract","deal","partnership","launch","expansion","demand","recovery","acquire","acquisition","buyback","dividend","order","orders","guidance","optimistic","bullish","breakout","upside"}
-NEG = {"miss","missed","loss","losses","fall","falls","drop","drops","decline","declined","plunge","plunged","crash","down","weak","downgrade","downgraded","underperform","lawsuit","investigation","fraud","scandal","default","debt","warning","penalty","fine","layoff","delay","recall","probe","resign","resignation","cut","cuts","regulatory","ban","strike","slump","concern","bearish","selloff","breakdown","downside"}
+POS_WORDS = {
+    "beat", "beats", "beating", "growth", "growing", "profit", "profits", "profitable",
+    "surge", "surges", "surged", "surging", "rally", "rallies", "rallied", "rallying",
+    "rise", "rises", "rising", "rose", "gain", "gains", "gained", "gaining",
+    "jump", "jumps", "jumped", "jumping", "soar", "soars", "soared", "soaring",
+    "strong", "strength", "upgrade", "upgrades", "upgraded", "outperform", "outperformed",
+    "record", "records", "boost", "boosts", "boosted", "boosting", "approval", "approved",
+    "contract", "contracts", "deal", "deals", "partnership", "partnerships", "expansion",
+    "demand", "recovery", "recovering", "acquire", "acquired", "acquisition", "buyback",
+    "dividend", "dividends", "guidance", "optimistic", "bullish", "breakout", "upside",
+    "rebound", "rebounds", "inflow", "inflows", "stimulus",
+    "advances", "advanced", "climbs", "climbed", "firm", "firmer", "buyers", "buying",
+}
+
+NEG_WORDS = {
+    "miss", "misses", "missed", "missing", "loss", "losses", "fall", "falls", "fell", "falling",
+    "drop", "drops", "dropped", "dropping", "decline", "declines", "declined", "declining",
+    "plunge", "plunges", "plunged", "plunging", "crash", "crashes", "crashed", "crashing",
+    "tumble", "tumbles", "tumbled", "tumbling", "slump", "slumps", "slumped", "slumping",
+    "weak", "weakness", "downgrade", "downgrades", "downgraded", "underperform", "underperformed",
+    "lawsuit", "lawsuits", "investigation", "fraud", "scandal", "default", "defaults",
+    "warning", "warnings", "penalty", "penalties", "layoff", "layoffs", "delay", "delays",
+    "delayed", "recall", "probe", "probes", "resign", "resigns", "resigned", "resignation",
+    "regulatory", "ban", "bans", "banned", "strike", "strikes", "concern", "concerns",
+    "bearish", "selloff", "selloffs", "breakdown", "downside", "inflation", "deficit",
+    "violation", "violations", "slapped", "penalty", "penalties", "fined",
+    "lower", "slips", "slipped", "sinks", "sank", "tanks", "tanked", "cracks", "cracked",
+    "sheds", "shed", "slides", "slid", "retreats", "retreated", "sellers", "selling",
+    "outflow", "outflows", "worries", "fears", "npa", "npas", "weakens", "weakened",
+}
+
+# Contextual multi-word financial phrases
+POS_PHRASES = [
+    "rate cut", "rates cut", "repo rate cut", "slashes rates", "cuts rates", "cut rates",
+    "debt reduction", "debt cut", "debt free", "cut debt", "reduces debt", "reducing debt", "repay debt", "clears debt",
+    "boosts shares", "boost shares", "shares surge", "shares rally", "shares jump", "sensex surges", "nifty surges",
+    "market rallies", "record high", "all time high", "beats estimates", "above expectations", "robust growth",
+    "order win", "bags order", "bagged order", "secures order", "order inflow", "contract win", "bags deal",
+    "profit surge", "profit rises", "earnings jump", "upward revision",
+    "snap losing streak", "snaps losing streak", "snap four-day losing streak", "inflation cools", "inflation eases",
+    "inflation falls", "net buyers", "turn net buyers", "oil prices fall", "crude falls", "crude eases",
+    "ends higher", "settles higher", "settle higher", "close higher", "ends in green",
+]
+
+NEG_PHRASES = [
+    "rate hike", "rates hike", "hikes rates", "hike rates", "debt worries", "debt crisis", "debt burden",
+    "debt default", "job cuts", "job cut", "cuts jobs", "layoffs announced", "slapped with fine", "imposed fine",
+    "regulatory probe", "misses estimates", "below expectations", "profit falls", "profit drops", "profit decline",
+    "revenue decline", "downgrade rating", "slump in demand",
+    "ends lower", "settles lower", "settle lower", "close lower", "ends in red", "net sellers", "turn net sellers",
+    "oil prices rise", "oil prices surge", "crude surges", "crude rises", "rupee weakens", "rupee falls",
+    "npa rise", "npas rise", "bad loans rise", "losing streak",
+]
+
+POS = POS_WORDS
+NEG = NEG_WORDS
 MARKET_TERMS = {
     "sensex","nifty","nifty 50","nifty bank","bank nifty","bse","nse","sebi","rbi","rupee","inflation",
     "interest rate","repo rate","oil","crude","tariff","gdp","india stock market","share market","stocks",
@@ -39,11 +93,83 @@ EVENT_WEIGHTS = {"earnings":1.0,"guidance":0.95,"m&a":0.9,"contract":0.75,"regul
 SOURCE_WEIGHTS = {"reuters":1.0,"economic times":0.95,"moneycontrol":0.9,"business standard":0.9,"livemint":0.9,"financial express":0.85,"the hindu":0.85,"hindustan times":0.8,"times of india":0.78}
 
 def lexical_sentiment(text: str) -> float:
-    words = re.findall(r"[a-zA-Z][a-zA-Z-]*", text.lower())
-    p = sum(w in POS for w in words)
-    n = sum(w in NEG for w in words)
-    if p+n == 0: return 0.0
-    return round((p-n)/(p+n), 3)
+    low = text.lower().strip()
+    if not low:
+        return 0.0
+
+    # 1. Handle contrast clauses (e.g. "Sensex falls despite strong earnings")
+    for sep in [" despite ", " in spite of ", " even as "]:
+        if sep in low:
+            parts = low.split(sep, 1)
+            main_score = lexical_sentiment(parts[0])
+            sub_score = lexical_sentiment(parts[1])
+            if abs(main_score) > 0.05:
+                return round(main_score * 0.85, 3)
+            return round(main_score * 0.7 - sub_score * 0.3, 3)
+
+    # 2. Match multi-word financial phrases first
+    p_score = 0.0
+    n_score = 0.0
+    for phrase in POS_PHRASES:
+        if phrase in low:
+            p_score += 2.0
+            low = low.replace(phrase, " ")   # do not re-count its words below
+    for phrase in NEG_PHRASES:
+        if phrase in low:
+            n_score += 2.0
+            low = low.replace(phrase, " ")
+
+    # 3. Tokenize words with contextual polarity
+    words = re.findall(r"[a-zA-Z][a-zA-Z-]*", low)
+    for i, w in enumerate(words):
+        prev_word = words[i-1] if i > 0 else ""
+        next_word = words[i+1] if i < len(words)-1 else ""
+        is_negated = prev_word in {"not", "no", "never", "without", "hardly", "failed"}
+
+        # Special context word: "cut" (interest rate cut is bullish; job cut is bearish)
+        if w in {"cut", "cuts"}:
+            if prev_word in {"rate", "rates", "repo", "interest", "cost", "costs", "debt", "tax", "taxes"} or next_word in {"rates", "rate", "debt", "taxes"}:
+                p_score += 1.5 if not is_negated else -1.0
+            elif prev_word in {"job", "jobs", "spending", "dividend", "guidance"}:
+                n_score += 1.5 if not is_negated else -1.0
+            continue
+
+        # Special context word: "debt"
+        if w in {"debt"}:
+            if next_word in {"reduction", "cut", "free", "repay", "clear", "relief"} or prev_word in {"cuts", "reduces", "clears", "lowers"}:
+                p_score += 1.5
+            elif next_word in {"crisis", "default", "woes", "burden", "load", "surge"}:
+                n_score += 1.5
+            continue
+
+        # Special context word: "order"
+        if w in {"order", "orders"}:
+            if prev_word in {"bag", "bags", "bagged", "win", "wins", "won", "secure", "secures", "secured", "new", "fresh", "mega", "big"}:
+                p_score += 1.5
+            continue
+
+        # Special context word: "fine"
+        if w in {"fine", "fines"}:
+            if next_word in {"performance", "result", "results", "growth", "shape", "form"}:
+                p_score += 1.0
+            else:
+                n_score += 1.5
+            continue
+
+        if w in POS_WORDS:
+            if is_negated:
+                n_score += 1.0
+            else:
+                p_score += 1.0
+        elif w in NEG_WORDS:
+            if is_negated:
+                p_score += 0.8
+            else:
+                n_score += 1.0
+
+    if p_score + n_score == 0:
+        return 0.0
+    return round((p_score - n_score) / (p_score + n_score), 3)
 
 def classify_event(text: str):
     low = text.lower()
@@ -128,7 +254,7 @@ class NewsService:
         retry = Retry(total=2, backoff_factor=0.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET"}), respect_retry_after_header=True)
         self.session = requests.Session()
         self.session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
-        self.session.headers.update({"User-Agent":"RadheStockMarketPredictor/3.0"})
+        self.session.headers.update({"User-Agent":"SuyashStockMarketPredictor/3.0"})
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float,list[dict]]] = {}
         self._toi = TOIBackground(settings.toi_refresh_minutes, state_dir=state_dir)
@@ -284,9 +410,16 @@ class NewsService:
                 combined.extend([dict(x) for x in self._x_cache[1]])
 
         combined.sort(key=lambda x: (float(x.get("relevance",0))*2 + abs(float(x.get("impact",0)))), reverse=True)
-        top=combined[: self.max_records]
-        summary=self.aggregate(top)
-        display=self.display_snapshot(symbol,company)
+        # Filter for market relevance: exclude irrelevant geopolitical sections (Pakistan, World, South Asia, etc.)
+        market_pool = [
+            x for x in combined
+            if x.get("section", "").lower() in DISPLAY_SECTIONS
+            or float(x.get("relevance", 0.0)) >= 1.0
+        ]
+        impact_pool = market_pool if len(market_pool) >= 3 else combined
+        top = impact_pool[: self.max_records]
+        summary = self.aggregate(top)
+        display = self.display_snapshot(symbol,company)
         return {
             "summary":summary,
             "articles":top,
@@ -302,17 +435,26 @@ class NewsService:
         if not items:
             return {"headline_count":0,"sentiment":0.0,"impact":0.0,"positive":0,"negative":0,"neutral":0,"top_event":"none"}
         counts={"positive":0,"negative":0,"neutral":0}
-        impacts=[]; events={}
+        total_weight=0.0
+        weighted_impact=0.0
+        weighted_sentiment=0.0
+        events={}
         for a in items:
             s=float(a.get("sentiment",0))
+            imp=float(a.get("impact",0))
+            rel=max(0.5, float(a.get("relevance",1.0)))
             label="positive" if s>0.15 else "negative" if s<-0.15 else "neutral"
             counts[label]+=1
-            impacts.append(float(a.get("impact",0)))
-            events[a.get("event","other")]=events.get(a.get("event","other"),0)+abs(float(a.get("impact",0)))
+            weighted_impact += imp * rel
+            weighted_sentiment += s * rel
+            total_weight += rel
+            events[a.get("event","other")]=events.get(a.get("event","other"),0)+abs(imp)*rel
+        avg_sentiment = round(weighted_sentiment / total_weight, 4) if total_weight > 0 else 0.0
+        avg_impact = round(max(-1.0, min(1.0, weighted_impact / total_weight)), 4) if total_weight > 0 else 0.0
         return {
             "headline_count":len(items),
-            "sentiment":round(sum(float(a.get("sentiment",0)) for a in items)/len(items),4),
-            "impact":round(max(-1,min(1,sum(impacts)/len(impacts))),4),
+            "sentiment":avg_sentiment,
+            "impact":avg_impact,
             **counts,"top_event":max(events,key=events.get) if events else "none"
         }
 

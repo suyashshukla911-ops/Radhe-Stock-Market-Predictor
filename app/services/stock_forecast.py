@@ -56,53 +56,73 @@ class StockForecastService:
         return d.replace([np.inf,-np.inf],np.nan)
 
     @staticmethod
-    def _next_trading_session(date_value):
+    def _is_trading_day(d):
+        from app.config import NSE_HOLIDAYS_SET
+        return d.weekday() < 5 and d.isoformat() not in NSE_HOLIDAYS_SET
+
+    @classmethod
+    def _next_trading_session(cls, date_value, now=None):
+        """Session whose close is being forecast: today if today's close has not printed yet."""
+        now = now or datetime.now(ZoneInfo(IST))
+        if cls._is_trading_day(date_value) and now.hour*60+now.minute < 15*60+30:
+            return date_value
         d = date_value + timedelta(days=1)
-        while d.weekday() >= 5:
+        while not cls._is_trading_day(d):
             d += timedelta(days=1)
         return d
 
     def forecast(self, instrument: Instrument, force: bool=False) -> dict:
         key=instrument.instrument_key
         cached=self.cache.get(key)
-        if cached and not force and datetime.now(ZoneInfo(IST)).timestamp()-cached[0] < 1800:
-            return cached[1].__dict__
+        now_ts=datetime.now(ZoneInfo(IST)).timestamp()
+        if cached and not force and now_ts-cached[0] < 1800:
+            return cached[1].copy()
         daily=self.upstox.get_daily_history(key,max(400,settings.train_days_long*4))
         if daily.empty or len(daily)<80:
             raise ValueError("Not enough real daily Upstox data for next-session stock forecast.")
+        
+        # Avoid using today's forming daily bar during market hours
+        daily["timestamp"]=pd.to_datetime(daily["timestamp"],utc=True).dt.tz_convert(IST)
+        today=datetime.now(ZoneInfo(IST)).date()
+        if UpstoxClient.is_market_open():
+            daily=daily.loc[daily.timestamp.dt.date<today].copy()
+        if len(daily)<60:
+            raise ValueError("Not enough completed daily history for stock forecast.")
+
         d=self._features(daily)
         d["next_close_ret"]=d.close.shift(-1)/d.close-1
         d["next_high_ret"]=d.high.shift(-1)/d.close-1
         d["next_low_ret"]=d.low.shift(-1)/d.close-1
         d["direction"]=(d.next_close_ret>0).astype(int)
         train=d.iloc[:-1].dropna(subset=FEATURES+['next_close_ret','next_high_ret','next_low_ret','direction']).copy()
-        if len(train)<60 or train.direction.nunique()<2:
+        if len(train)<50 or train.direction.nunique()<2:
             raise ValueError("Real daily stock history is not sufficient for next-session training.")
-        split=max(40,int(len(train)*0.85))
+        split=max(35,int(len(train)*0.80))
         X=train[FEATURES]; y=train.direction
         clf=HistGradientBoostingClassifier(learning_rate=0.04,max_iter=120,max_leaf_nodes=16,min_samples_leaf=10,l2_regularization=0.2,random_state=42)
         clf.fit(X.iloc[:split],y.iloc[:split])
         val_p=clf.predict(X.iloc[split:])
         accuracy=float(accuracy_score(y.iloc[split:],val_p)) if split<len(train) else 0.5
         clf.fit(X,y)
-        reg_args=dict(learning_rate=0.04,max_iter=140,max_leaf_nodes=16,min_samples_leaf=10,l2_regularization=0.2,loss="absolute_error",random_state=42)
+        reg_args=dict(learning_rate=0.04,max_iter=120,max_leaf_nodes=16,min_samples_leaf=10,l2_regularization=0.2,loss="absolute_error",random_state=42)
         ret=HistGradientBoostingRegressor(**reg_args).fit(X,train.next_close_ret)
         hi=HistGradientBoostingRegressor(**reg_args).fit(X,train.next_high_ret)
         lo=HistGradientBoostingRegressor(**reg_args).fit(X,train.next_low_ret)
-        extra=ExtraTreesRegressor(n_estimators=80,max_depth=10,min_samples_leaf=5,random_state=42,n_jobs=-1).fit(X,train.next_close_ret)
+        extra=ExtraTreesRegressor(n_estimators=40,max_depth=8,min_samples_leaf=5,random_state=42,n_jobs=-1).fit(X,train.next_close_ret)
         latest=d.dropna(subset=FEATURES).iloc[[-1]]
         price=float(latest.close.iloc[0]); raw_p=float(clf.predict_proba(latest[FEATURES])[0,1])
         news=self.news.snapshot(instrument.trading_symbol,instrument.name or instrument.trading_symbol)
         impact=float(news["summary"].get("impact",0.0))
-        prob=float(np.clip(0.9*raw_p+0.1*(0.5+0.5*impact),0.01,0.99))
+        prob=float(np.clip(0.88*raw_p+0.12*(0.5+0.5*impact),0.01,0.99))
         r=0.65*float(ret.predict(latest[FEATURES])[0])+0.35*float(extra.predict(latest[FEATURES])[0])
         h=float(hi.predict(latest[FEATURES])[0]); l=float(lo.predict(latest[FEATURES])[0])
         forecast=StockForecast(
             symbol=instrument.trading_symbol, company=instrument.name or instrument.trading_symbol,
             current_price=price, next_day_close=price*(1+r), next_day_high=price*(1+max(h,r,0)), next_day_low=price*(1+min(l,r,0)),
-            up_probability=prob, signal="UP" if prob>=0.6 else "DOWN" if prob<=0.4 else "NEUTRAL",
+            up_probability=prob, signal="UP" if prob>=0.55 else "DOWN" if prob<=0.45 else "NEUTRAL",
             news_impact=impact, training_rows=len(train), generated_at=datetime.now(ZoneInfo(IST)).isoformat()
         )
-        self.cache[key]=(datetime.now(ZoneInfo(IST)).timestamp(),forecast)
-        next_session = self._next_trading_session(datetime.now(ZoneInfo(IST)).date())
-        return forecast.__dict__ | {"validation_accuracy":round(accuracy*100,2), "next_session_date": next_session.isoformat()}
+        next_session = self._next_trading_session(today)
+        result = forecast.__dict__ | {"validation_accuracy":round(accuracy*100,2), "next_session_date": next_session.isoformat()}
+        self.cache[key]=(now_ts, result)
+        return result.copy()

@@ -24,7 +24,7 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 def add_context(base: pd.DataFrame, context: dict[str, pd.DataFrame]) -> pd.DataFrame:
     out = base.copy().sort_values("timestamp")
-    tolerance = pd.Timedelta("60min")
+    tolerance = pd.to_timedelta(60, unit="m")
     for name, ctx in context.items():
         if ctx is None or ctx.empty:
             out[f"{name}_return"] = 0.0
@@ -63,7 +63,7 @@ def build_features(df: pd.DataFrame, context: dict[str, pd.DataFrame] | None = N
     data["lower_wick_pct"] = (bot-data["low"]) / data["close"].replace(0,np.nan)
 
     tr = pd.concat([(data["high"]-data["low"]), (data["high"]-prev_close).abs(), (data["low"]-prev_close).abs()], axis=1).max(axis=1)
-    data["atr_pct"] = (tr.rolling(14, min_periods=5).mean() / data["close"].replace(0,np.nan)).bfill().fillna(0.0)
+    data["atr_pct"] = (tr.rolling(14, min_periods=5).mean() / data["close"].replace(0,np.nan)).ffill().fillna(0.0)
     data["rsi_14"] = _rsi(data["close"])
     ema9 = data["close"].ewm(span=9, adjust=False).mean()
     ema20 = data["close"].ewm(span=20, adjust=False).mean()
@@ -72,8 +72,8 @@ def build_features(df: pd.DataFrame, context: dict[str, pd.DataFrame] | None = N
     data["ema_spread"] = ema9/ema20-1
 
     ret = data["return_1"]
-    data["volatility_20"] = ret.rolling(20, min_periods=5).std().bfill().fillna(0.0)
-    data["volatility_60"] = ret.rolling(60, min_periods=10).std().bfill().fillna(0.0)
+    data["volatility_20"] = ret.rolling(20, min_periods=5).std().ffill().fillna(0.0)
+    data["volatility_60"] = ret.rolling(60, min_periods=10).std().ffill().fillna(0.0)
     vm = data["volume"].rolling(30, min_periods=5).mean()
     vs = data["volume"].rolling(30, min_periods=5).std().replace(0,np.nan)
     data["volume_z"] = ((data["volume"]-vm)/vs).replace([np.inf,-np.inf],np.nan).fillna(0.0)
@@ -117,23 +117,37 @@ def build_features(df: pd.DataFrame, context: dict[str, pd.DataFrame] | None = N
     else:
         for c in ["nifty_return","banknifty_return","vix_return"]:
             data[c] = 0.0
+    for c in ["nifty_return","banknifty_return","vix_return"]:
+        if c not in data.columns:
+            data[c] = 0.0
     return data.replace([np.inf,-np.inf],np.nan)
 
 def add_targets(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
     session = data["timestamp"].dt.date
-    # The final row of each session is removed below, so next_return does not
-    # cross from one cash session into the next.
+    # Target T+1
     data["next_return"] = data["close"].shift(-1)/data["close"]-1
     data["next_high_return"] = data["high"].shift(-1)/data["close"]-1
     data["next_low_return"] = data["low"].shift(-1)/data["close"]-1
     data["direction"] = (data["next_return"]>0).astype(int)
+
+    # Target T+2 (direct multi-step target)
+    # shift inside each session so the 2nd-to-last bar never targets tomorrow's open
+    by_session = data.groupby(session)
+    data["next_2_return"] = by_session["close"].shift(-2)/data["close"]-1
+    data["next_2_high_return"] = by_session["high"].shift(-2)/data["close"]-1
+    data["next_2_low_return"] = by_session["low"].shift(-2)/data["close"]-1
+
     session_close = data.groupby(session)["close"].transform("last")
     data["eod_return"] = session_close/data["close"]-1
-    data["is_session_last"] = data["timestamp"].eq(data.groupby(session)["timestamp"].transform("max"))
+    max_ts = data.groupby(session)["timestamp"].transform("max")
+    data["is_session_last"] = data["timestamp"].eq(max_ts)
     return data
 
 def prepare_training_frame(df: pd.DataFrame, context: dict[str, pd.DataFrame] | None = None) -> pd.DataFrame:
     data = add_targets(build_features(df, context=context))
     data = data.loc[~data["is_session_last"]].copy()
+    data["next_2_return"] = data["next_2_return"].fillna(data["next_return"])
+    data["next_2_high_return"] = data["next_2_high_return"].fillna(data["next_high_return"])
+    data["next_2_low_return"] = data["next_2_low_return"].fillna(data["next_low_return"])
     return data.dropna(subset=FEATURES+["next_return","next_high_return","next_low_return","direction","eod_return"])

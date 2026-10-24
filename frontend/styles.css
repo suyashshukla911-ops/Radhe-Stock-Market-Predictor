@@ -28,3 +28,7 @@
 .stock-explain{margin-top:10px;border-radius:12px;padding:11px 13px;background:#f5f9fd;border:1px solid #dfe8f0;color:var(--muted);font-size:12px;line-height:1.55}
 .stock-error{display:flex;flex-direction:column;gap:5px;border-color:#efc1c6;background:#fff6f7;color:#8f2630}
 @media(max-width:700px){.ohlc-strip{grid-template-columns:repeat(2,1fr)}.forecast-line{flex-direction:column;gap:3px}.stock-result-head{flex-direction:column}.chart{height:390px}#actual-chart,#forecast-chart{min-height:390px}}
+.validation-strip{display:flex;flex-direction:column;gap:6px;margin:8px 0;padding:8px 10px;background:#f8fbfe;border:1px solid var(--border);border-radius:10px}
+.validation-strip:empty{display:none}
+.val{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted)}
+.val b{color:var(--ink);font-variant-numeric:tabular-nums}

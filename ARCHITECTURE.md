@@ -1,4 +1,4 @@
-# Radhe Stock Market Predictor — Live Trading Architecture
+# Suyash Stock Market Predictor — Live Trading Architecture
 
 ## 1. Actual market dashboard
 The first dashboard is the market truth layer.

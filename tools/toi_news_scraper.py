@@ -1,50 +1,15 @@
 """
 Times of India -> structured Excel news scraper
 
-Run this script before the stock-prediction model.
-It scrapes TOI category pages and writes one Excel file to:
-    D:\toi_output\toi_market_news.xlsx
-
-The Excel workbook contains:
-    news          - unique headlines + URLs + model_text
-    sections      - status/count for every section attempted
-    run_metadata  - run information
-    README        - field descriptions
-
-The script automatically creates D:\toi_output if it does not exist.
-It also installs missing Python packages the first time it is run.
+Run this script to scrape TOI category pages and generate an Excel news export.
+The output directory defaults to 'toi_output/toi_market_news.xlsx' (or configured via TOI_OUTPUT_DIR).
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# 1. Install missing packages automatically (so IDLE does not stop at
-#    "ModuleNotFoundError: No module named 'openpyxl'").
-# ---------------------------------------------------------------------------
-import importlib.util
-import subprocess
-import sys
-
-REQUIRED_PACKAGES = {
-    "requests": "requests",
-    "bs4": "beautifulsoup4",
-    "openpyxl": "openpyxl",
-}
-
-missing = [
-    package_name
-    for module_name, package_name in REQUIRED_PACKAGES.items()
-    if importlib.util.find_spec(module_name) is None
-]
-
-if missing:
-    print("Installing missing packages:", ", ".join(missing))
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-
-# ---------------------------------------------------------------------------
-# 2. Imports
-# ---------------------------------------------------------------------------
+import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path

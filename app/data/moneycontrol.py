@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
@@ -51,16 +52,38 @@ class MoneyControlScraper:
                       allowed_methods=frozenset({"GET"}),
                       respect_retry_after_header=True)
         self.session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4))
+        self.user_agent = "SuyashStockMarketPredictor/4.0 (market research)"
         self.session.headers.update({
-            "User-Agent": "RadheStockMarketPredictor/4.0 (market research)",
+            "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-IN,en;q=0.9",
         })
+        self.robots = RobotFileParser()
+        self.robots.set_url("https://www.moneycontrol.com/robots.txt")
+        self._robots_loaded = False
         self.state_file = Path(state_dir) / "moneycontrol_news.json"
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.snapshot: MoneyControlSnapshot | None = None
         self._lock = threading.RLock()
         self._load()
+
+    def _robots_ok(self, url: str) -> bool:
+        if not self._robots_loaded:
+            try:
+                rr = self.session.get("https://www.moneycontrol.com/robots.txt", timeout=10)
+                if rr.status_code == 200:
+                    self.robots.parse(rr.text.splitlines())
+                elif rr.status_code in (401, 403):
+                    return False
+                else:
+                    self.robots.allow_all = True
+                self._robots_loaded = True
+            except Exception:
+                return False
+        try:
+            return self.robots.can_fetch(self.user_agent, url)
+        except Exception:
+            return True
 
     def _load(self):
         try:
@@ -78,6 +101,8 @@ class MoneyControlScraper:
 
     def scrape(self) -> MoneyControlSnapshot:
         try:
+            if not self._robots_ok(BASE):
+                return MoneyControlSnapshot(datetime.now(timezone.utc).isoformat(), [], "robots.txt disallows fetch")
             r = self.session.get(BASE, timeout=25)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")

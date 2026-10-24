@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import json
+import os
 import secrets
+import threading
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import PRIORITY_STOCKS, settings
+from app.config import IST, PRIORITY_STOCKS, settings
 from app.data.news import NewsService
 from app.data.upstox import LiveMarketHub, UpstoxClient, UpstoxError
 from app.services.engine import AnalysisEngine
@@ -18,20 +25,51 @@ from app.services.stock_forecast import StockForecastService
 BASE_DIR=Path(__file__).resolve().parents[1]
 FRONTEND_DIR=BASE_DIR/"frontend"
 
-app=FastAPI(title=settings.app_name, version="3.0.0")
-app.mount("/static",StaticFiles(directory=FRONTEND_DIR),name="static")
+CACHE_DIR=Path(os.getenv("CACHE_DIR") or os.getenv("DATA_DIR") or BASE_DIR/"data_cache")
+try: CACHE_DIR.mkdir(parents=True,exist_ok=True)
+except OSError: CACHE_DIR=BASE_DIR/"data_cache"; CACHE_DIR.mkdir(parents=True,exist_ok=True)
+TOKEN_FILE=CACHE_DIR/"upstox_token.json"
 
-upstox=UpstoxClient(settings.upstox_access_token,cache_dir=str(BASE_DIR/"data_cache"))
+def _load_saved_token():
+    """Re-use today's OAuth token after a restart (Upstox tokens expire ~03:30 IST next day)."""
+    try:
+        obj=json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        issued=datetime.fromisoformat(obj["issued_at"]); now=datetime.now(ZoneInfo(IST))
+        expiry=issued.replace(hour=3,minute=30,second=0,microsecond=0)
+        if expiry<=issued: expiry+=timedelta(days=1)
+        return obj["access_token"] if now<expiry else ""
+    except Exception: return ""
+
+upstox=UpstoxClient(_load_saved_token() or settings.upstox_access_token,cache_dir=str(CACHE_DIR))
 live=LiveMarketHub(upstox)
-news=NewsService(settings.news_api_key,max_records=20,state_dir=str(BASE_DIR/"data_cache"))
+news=NewsService(settings.news_api_key,max_records=20,state_dir=str(CACHE_DIR))
 engine=AnalysisEngine(upstox,live,news)
 stock_forecaster=StockForecastService(upstox,news)
 oauth_states:set[str]=set()
 
-@app.on_event("startup")
-def startup_event():
+def _eod_locker():
+    """Create the fixed EOD outlook at ~09:20-09:45 IST even if nobody has the page open."""
+    while True:
+        try:
+            now=datetime.now(ZoneInfo(IST)); m=now.hour*60+now.minute
+            if upstox.connected and UpstoxClient.is_market_open() and 9*60+20<=m<=11*60:
+                for name in ("SENSEX","NIFTY 50"):
+                    ins=upstox.resolve_symbol(name)
+                    if f"{ins.instrument_key}|{engine._today()}" not in engine._eod_cache:
+                        try: engine.analyze(ins,5)
+                        except Exception: pass
+        except Exception: pass
+        time.sleep(30)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     live.start()
     news.start()
+    threading.Thread(target=_eod_locker,name="eod-locker",daemon=True).start()
+    yield
+
+app=FastAPI(title=settings.app_name, version="3.0.0", lifespan=lifespan)
+app.mount("/static",StaticFiles(directory=FRONTEND_DIR),name="static")
 
 @app.get("/",include_in_schema=False)
 def index(): return FileResponse(FRONTEND_DIR/"index.html")
@@ -77,8 +115,11 @@ def stocks(q:str=Query("",max_length=80),limit:int=Query(50,ge=1,le=100)):
         raise HTTPException(503,str(exc))
 
 @app.get("/api/universe")
-def universe():
-    try: return upstox.universe_summary()
+def universe(limit: int = Query(100, ge=10, le=5000)):
+    try:
+        summary = upstox.universe_summary()
+        summary["results"] = summary["results"][:limit]
+        return summary
     except Exception as exc: raise HTTPException(503,str(exc))
 
 @app.get("/api/market-pulse")
@@ -115,7 +156,7 @@ def news_endpoint(symbol:str="SENSEX",name:str="SENSEX"):
 def news_download():
     try:
         path=news.export_toi_excel()
-        return FileResponse(path,path=path,filename="toi_market_news.xlsx",media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return FileResponse(path,filename="toi_market_news.xlsx",media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as exc:
         raise HTTPException(503,str(exc))
 
@@ -141,6 +182,7 @@ def analyze(symbol:str=Query(...,min_length=1,max_length=100),interval:str=Query
         return engine.analyze(ins,interval=int(interval),force_retrain=retrain)
     except UpstoxError as exc: raise HTTPException(503,str(exc))
     except ValueError as exc: raise HTTPException(422,str(exc))
+    except HTTPException: raise
     except Exception as exc: raise HTTPException(500,f"Analysis failed: {exc}")
 
 @app.get("/api/stock-forecast")
@@ -167,11 +209,8 @@ def live_state(symbol:str=Query(...,min_length=1,max_length=100),interval:str=Qu
         ins=upstox.resolve_symbol(symbol)
         return engine.live_state(ins,interval if interval=="1d" else int(interval))
     except Exception as exc:
-        # Live state is a dashboard endpoint: never turn a temporary provider
-        # problem into a blank/erroring page. Return a structured 200 response
-        # so the UI can keep the last known state and retry on its normal cadence.
         return {
-            "now": __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Kolkata")).isoformat(),
+            "now": datetime.now(ZoneInfo(IST)).isoformat(),
             "instrument_key":"",
             "symbol":symbol,
             "tick":None,
@@ -214,6 +253,8 @@ def upstox_callback(code:Optional[str]=None,state:Optional[str]=None,error:Optio
         token=response.json().get("access_token")
         if not token: raise ValueError("No access token returned")
         upstox.set_access_token(token)
+        try: TOKEN_FILE.write_text(json.dumps({"access_token":token,"issued_at":datetime.now(ZoneInfo(IST)).isoformat()}),encoding="utf-8")
+        except Exception: pass
         live.start()
         return RedirectResponse("/?connected=1")
     except Exception as exc:

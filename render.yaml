@@ -3,10 +3,19 @@ services:
     name: radhe-stock-market-predictor
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    # disk:            # needs a paid instance; keeps EOD outlook + token across restarts
+    #   name: data
+    #   mountPath: /var/data
+    #   sizeGB: 1
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: CACHE_DIR
+        value: /var/data
       - key: APP_NAME
-        value: Radhe Stock Market Predictor
+        value: Suyash Stock Market Predictor
       - key: APP_BASE_URL
         sync: false
       - key: UPSTOX_ACCESS_TOKEN
