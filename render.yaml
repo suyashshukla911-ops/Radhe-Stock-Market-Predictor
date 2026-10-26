@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: radhe-stock-market-predictor
+    name: suyash-stock-market-predictor
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
@@ -12,8 +12,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
-      - key: CACHE_DIR
-        value: /var/data
+      # - key: CACHE_DIR # Uncomment only if a persistent disk is mounted at /var/data
+      #   value: /var/data
       - key: APP_NAME
         value: Suyash Stock Market Predictor
       - key: APP_BASE_URL

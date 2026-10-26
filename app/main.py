@@ -17,9 +17,9 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import CACHE_DIR, IST, PRIORITY_STOCKS, settings
+from app.config import CACHE_DIR, IST, NSE_HOLIDAYS_LIST, PRIORITY_STOCKS, settings
 from app.data.news import NewsService
-from app.data.upstox import LiveMarketHub, UpstoxClient, UpstoxError
+from app.data.upstox import LiveMarketHub, UpstoxAuthError, UpstoxClient, UpstoxError
 from app.services.engine import AnalysisEngine
 from app.services.stock_forecast import StockForecastService
 
@@ -60,12 +60,14 @@ def _eod_locker():
                 for name in ("SENSEX", "NIFTY 50"):
                     ins = upstox.resolve_symbol(name)
                     if f"{ins.instrument_key}|{engine._today()}" not in engine._eod_cache:
+                        logger.info("EOD locker: locking morning outlook for %s", name)
                         try:
                             engine.analyze(ins, 5)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                            logger.info("EOD locker: successfully locked %s", name)
+                        except Exception as exc:
+                            logger.warning("EOD locker: failed to lock %s: %s", name, exc)
+        except Exception as exc:
+            logger.warning("EOD locker loop error: %s", exc)
         time.sleep(30)
 
 @asynccontextmanager
@@ -83,10 +85,12 @@ async def add_security_and_cache_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    if request.url.path in ("/", "/index.html") or request.url.path.startswith("/static/"):
+    if request.url.path in ("/", "/index.html"):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+    elif request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
@@ -101,6 +105,7 @@ def health():
     token_age = None
     token_issued = None
     token_expiry = None
+    is_expired = False
     if TOKEN_FILE.exists():
         try:
             info = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
@@ -112,10 +117,12 @@ def health():
             if expiry <= issued:
                 expiry += timedelta(days=1)
             token_expiry = expiry.isoformat()
+            if now >= expiry:
+                is_expired = True
         except Exception:
             pass
 
-    token_valid = bool(upstox.connected and (token_age is None or token_age < 86400))
+    token_valid = bool(upstox.connected and not is_expired and not upstox.last_auth_error and upstox.validate_token())
     models_ready = [f"{k[0]}:{k[1]}m" for k in engine.models.keys()]
 
     return {
@@ -126,6 +133,8 @@ def health():
         "token_issued_at": token_issued,
         "token_expires_at": token_expiry,
         "token_age_seconds": token_age,
+        "last_ok_at": upstox.last_ok_at,
+        "eod_locked": engine.eod_locked_status(),
         "market_clock": clock,
         "stream_connected": live.connected,
         "stream_error": live.last_error,
@@ -273,15 +282,39 @@ def live_state(symbol: str = Query(..., min_length=1, max_length=100), interval:
     try:
         ins = upstox.resolve_symbol(symbol)
         return engine.live_state(ins, interval if interval == "1d" else int(interval))
+    except UpstoxAuthError as exc:
+        logger.warning("Auth error in /api/live for symbol=%s interval=%s: %s", symbol, interval, exc)
+        return {
+            "now": datetime.now(ZoneInfo(IST)).isoformat(),
+            "instrument_key": "",
+            "symbol": symbol,
+            "tick": None,
+            "candles": [],
+            "current_candle": None,
+            "seconds_to_candle_close": 0,
+            "prediction": None,
+            "market_data": {
+                "stream_connected": live.connected,
+                "stream_error": str(exc),
+                "last_update_age_seconds": None,
+                "source": "unavailable",
+                "market_status": clock["market_status"],
+                "market_clock_label": clock["label"],
+                "data_status": "TOKEN_EXPIRED",
+                "data_message": "Upstox session expired (401/403). Please re-login.",
+                "last_market_price": None,
+                "last_market_candle": None,
+            },
+        }
     except Exception as exc:
         logger.exception("Error in /api/live for symbol=%s interval=%s: %s", symbol, interval, exc)
         err_str = str(exc)
         if not upstox.access_token:
             data_status = "NO_TOKEN"
             data_msg = "Upstox access token missing. Please connect Upstox."
-        elif any(x in err_str.lower() for x in ("401", "403", "unauthorized", "token", "expired")):
+        elif upstox.last_auth_error or any(x in err_str.lower() for x in ("401", "403", "unauthorized", "token", "expired")):
             data_status = "TOKEN_EXPIRED"
-            data_msg = "Upstox session expired. Please re-login."
+            data_msg = "Upstox session expired (401/403). Please re-login."
         elif clock["is_open"]:
             data_status = "FEED_DOWN"
             data_msg = f"Live feed recovering: {err_str}"
@@ -368,4 +401,5 @@ def config():
         "toi_refresh_minutes": settings.toi_refresh_minutes,
         "moneycontrol_refresh_minutes": settings.moneycontrol_refresh_minutes,
         "supports": {"timeframes": ["1", "5", "10", "15", "30", "60", "1d"]},
+        "nse_holidays": NSE_HOLIDAYS_LIST,
     }

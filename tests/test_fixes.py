@@ -1,5 +1,6 @@
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -145,5 +146,59 @@ def test_live_endpoint_returns_market_status_and_data_status(monkeypatch):
     mkt = data["market_data"]
     assert mkt["market_status"] in {"OPEN", "PRE_OPEN", "CLOSED", "WEEKEND", "HOLIDAY"}
     assert "data_status" in mkt
-    assert mkt["data_status"] in {"OK", "NO_TOKEN", "TOKEN_EXPIRED", "FEED_DOWN", "ERROR"}
+    assert mkt["data_status"] in {"OK", "NO_TOKEN", "TOKEN_EXPIRED", "FEED_DOWN", "ERROR", "DELAYED"}
+
+def test_upstox_auth_error_and_token_expired():
+    from app.data.upstox import UpstoxAuthError
+    up = UpstoxClient("dummy_token")
+    class MockResponse:
+        status_code = 401
+        text = "Unauthorized: token expired"
+    up.session.get = lambda url, **kwargs: MockResponse()
+    with pytest.raises(UpstoxAuthError):
+        up._get_json("https://api.upstox.com/v2/user/profile")
+    assert "401" in up.last_auth_error
+
+def test_live_state_delayed_when_age_over_90(monkeypatch):
+    up = UpstoxClient("token")
+    hub = LiveMarketHub(up)
+    news = NewsService("", state_dir="dummy")
+    engine = AnalysisEngine(up, hub, news)
+    monkeypatch.setattr(AnalysisEngine, "_market_open", lambda: True)
+    monkeypatch.setattr(up, "market_clock_status", lambda dt=None: {"market_status": "OPEN", "is_open": True, "label": "Market Open", "date": "2026-10-26"})
+    monkeypatch.setattr(hub, "latest", lambda key: {"price": 80000.0, "updated_at": (datetime.now(ZoneInfo(IST)) - timedelta(seconds=120)).isoformat(), "instrument_key": key, "session_trade": True})
+    monkeypatch.setattr(engine, "_live_snapshot", lambda ins, interval, ttl_seconds=None: mock_candles(5))
+    hub._connected = True
+    state = engine.live_state(INS, 5)
+    assert state["market_data"]["data_status"] == "DELAYED"
+    assert state["market_data"]["source"] == "rest-delayed"
+
+def test_config_endpoint_returns_holidays():
+    from starlette.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+    r = client.get("/api/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert "nse_holidays" in data
+    assert isinstance(data["nse_holidays"], list)
+    assert "2026-01-26" in data["nse_holidays"]
+    assert "2026-10-02" in data["nse_holidays"]
+
+def test_static_cache_control_no_cache():
+    from starlette.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+    r = client.get("/static/app.js")
+    assert r.status_code == 200
+    cc = r.headers.get("Cache-Control", "")
+    assert "no-cache" in cc
+    assert "no-store" not in cc
+
+def test_data_cache_remains_clean_after_tests():
+    from app.config import CACHE_DIR
+    import os
+    # Tests isolated by conftest should not write to root data_cache/
+    assert not (Path(__file__).resolve().parents[1] / "data_cache" / "eod_outlook.json").exists()
+
 

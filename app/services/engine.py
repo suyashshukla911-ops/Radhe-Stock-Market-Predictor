@@ -13,7 +13,7 @@ import pandas as pd
 
 from app.config import CACHE_DIR, IST, SECTOR_BY_SYMBOL, settings
 from app.data.news import NewsService
-from app.data.upstox import Instrument, LiveMarketHub, UpstoxClient, UpstoxError
+from app.data.upstox import Instrument, LiveMarketHub, UpstoxAuthError, UpstoxClient, UpstoxError
 from app.ml.features import FEATURES, build_features, prepare_training_frame
 from app.ml.model import CandleModel
 
@@ -40,11 +40,24 @@ class AnalysisEngine:
         self._train_error = {}
         self._eod_cache = {}
         self._morning_cache = {}
+        self.eod_locked = {}
         self._analysis_lock = threading.RLock()
         cache_dir = Path(os.getenv("CACHE_DIR") or os.getenv("DATA_DIR") or CACHE_DIR)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self._session_state_file = cache_dir / 'eod_outlook.json'
-        self._session_state_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_session_state()
+
+    def eod_locked_status(self) -> dict:
+        today = self._today()
+        status = {}
+        for k, v in self._eod_cache.items():
+            if k.endswith(f"|{today}"):
+                ins_key = k.split('|')[0]
+                status[ins_key] = v
+        return status
 
     def _load_session_state(self):
         try:
@@ -188,6 +201,8 @@ class AnalysisEngine:
                     self._rest_live_cache[instrument.instrument_key] = (time.time(), rest.copy())
                 elif not rest_cached:
                     self._rest_live_cache[instrument.instrument_key] = (time.time(), pd.DataFrame())
+            except UpstoxAuthError:
+                raise
             except Exception:
                 if rest_cached:
                     rest = rest_cached[1].copy()
@@ -368,14 +383,22 @@ class AnalysisEngine:
                 age = round(max(0, (now - datetime.fromisoformat(tick['updated_at'])).total_seconds()), 1)
             except Exception:
                 pass
-        data_status = "OK" if not bars.empty or self.upstox.connected else "NO_TOKEN"
+        if not self.upstox.access_token:
+            data_status = "NO_TOKEN"
+            data_msg = "Upstox access token missing. Please connect Upstox."
+        elif self.upstox.last_auth_error:
+            data_status = "TOKEN_EXPIRED"
+            data_msg = "Upstox session expired (401/403). Please re-login."
+        else:
+            data_status = "OK" if not bars.empty or self.upstox.connected else "NO_TOKEN"
+            data_msg = "Previous session daily history"
         return {
             'now': now.isoformat(), 'instrument_key': instrument.instrument_key, 'symbol': instrument.trading_symbol,
             'tick': tick, 'candles': rows, 'current_candle': candle, 'seconds_to_candle_close': 0, 'prediction': None, 'view_only': True,
             'market_data': {
                 'stream_connected': self.live.connected, 'stream_error': self.live.last_error, 'last_update_age_seconds': age,
                 'source': 'previous-session-history', 'market_status': clock["market_status"], 'market_clock_label': clock["label"],
-                'data_status': data_status, 'data_message': 'Previous session daily history',
+                'data_status': data_status, 'data_message': data_msg,
                 'last_market_price': float(bars.iloc[-1]['close']) if not bars.empty else (float(tick['price']) if tick else None),
                 'last_market_candle': bars.iloc[-1]['timestamp'].isoformat() if not bars.empty else None
             }
@@ -388,7 +411,11 @@ class AnalysisEngine:
         clock = UpstoxClient.market_clock_status(now)
         open_now = clock["is_open"]
         self.live.subscribe([instrument.instrument_key])
-        bars = self._live_snapshot(instrument, int(interval), ttl_seconds=settings.live_rest_cache_seconds)
+        bars = pd.DataFrame()
+        try:
+            bars = self._live_snapshot(instrument, int(interval), ttl_seconds=settings.live_rest_cache_seconds)
+        except UpstoxAuthError:
+            bars = pd.DataFrame()
         tick = self.live.latest(instrument.instrument_key)
         rows = [{'time': r.timestamp.isoformat(), 'open': float(r.open), 'high': float(r.high), 'low': float(r.low), 'close': float(r.close), 'volume': float(r.volume or 0)} for r in bars.tail(settings.chart_bars).itertuples()] if not bars.empty else []
         if tick is None and not bars.empty:
@@ -415,18 +442,34 @@ class AnalysisEngine:
         if not self.upstox.access_token:
             data_status = "NO_TOKEN"
             data_msg = "Upstox access token missing. Please connect Upstox."
+        elif self.upstox.last_auth_error:
+            data_status = "TOKEN_EXPIRED"
+            data_msg = "Upstox session expired (401/403). Please re-login."
         elif self.live.last_error and any(x in self.live.last_error.lower() for x in ("401", "403", "unauthorized", "token", "expired")):
             data_status = "TOKEN_EXPIRED"
             data_msg = "Upstox session expired. Please re-login."
         elif open_now and not self.live.connected and bars.empty:
             data_status = "FEED_DOWN"
             data_msg = "Live feed recovering. Waiting for market data."
+        elif open_now and age is not None and age > 90:
+            data_status = "DELAYED"
+            data_msg = f"Market data delayed ({int(age)}s old)"
         else:
             data_status = "OK"
             data_msg = "Feed operational"
 
         last_result = self.last_results.get((instrument.instrument_key, int(interval)))
         last_price = (float(tick['price']) if tick and tick.get('price') is not None else (float(bars.iloc[-1]['close']) if not bars.empty else None))
+
+        if self.live.connected and tick and open_now and (age is None or age <= 90):
+            source = "upstox-websocket"
+        elif open_now and age is not None and age > 90:
+            source = "rest-delayed"
+        elif open_now and not bars.empty:
+            source = "upstox-rest"
+        else:
+            source = "last-session-fallback"
+
         return {
             'now': now.isoformat(), 'instrument_key': instrument.instrument_key, 'symbol': instrument.trading_symbol,
             'tick': tick, 'candles': rows, 'current_candle': current, 'seconds_to_candle_close': secs,
@@ -434,7 +477,7 @@ class AnalysisEngine:
             'forecast_candles': last_result.get('forecast_candles', []) if last_result else [],
             'market_data': {
                 'stream_connected': self.live.connected, 'stream_error': self.live.last_error, 'last_update_age_seconds': age,
-                'source': 'upstox-websocket' if self.live.connected and tick and open_now else 'last-session-fallback',
+                'source': source,
                 'market_status': clock["market_status"], 'market_clock_label': clock["label"],
                 'data_status': data_status, 'data_message': data_msg,
                 'last_market_price': last_price, 'last_market_candle': bars.iloc[-1]['timestamp'].isoformat() if not bars.empty else None

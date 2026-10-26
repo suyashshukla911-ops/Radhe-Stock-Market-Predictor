@@ -45,9 +45,15 @@ class Instrument:
 class UpstoxError(RuntimeError):
     pass
 
+class UpstoxAuthError(UpstoxError):
+    pass
+
 class UpstoxClient:
     def __init__(self, access_token: str = "", cache_dir: Optional[str | Path] = None):
         self.access_token = access_token.strip()
+        self.last_auth_error: str = ""
+        self.last_ok_at: Optional[float] = None
+        self._token_val_cache: tuple[float, bool] = (0.0, False)
         self.session = requests.Session()
         retry = Retry(
             total=3, connect=3, read=3, backoff_factor=0.25,
@@ -70,6 +76,33 @@ class UpstoxClient:
 
     def set_access_token(self, token: str) -> None:
         self.access_token = token.strip()
+        self.last_auth_error = ""
+        self._token_val_cache = (0.0, False)
+
+    def validate_token(self) -> bool:
+        if not self.access_token:
+            return False
+        now = time.time()
+        if now - self._token_val_cache[0] < 60:
+            return self._token_val_cache[1]
+        try:
+            r = self.session.get(f"{UPSTOX_API}/v2/user/profile", headers=self._headers(), timeout=6)
+            if r.status_code == 200:
+                self.last_ok_at = now
+                self.last_auth_error = ""
+                self._token_val_cache = (now, True)
+                return True
+            if r.status_code in (401, 403):
+                self.last_auth_error = f"Upstox HTTP {r.status_code}: session expired or invalid"
+                self._token_val_cache = (now, False)
+                return False
+            valid = bool(self.last_ok_at and (now - self.last_ok_at) < 300)
+            self._token_val_cache = (now, valid)
+            return valid
+        except Exception:
+            valid = bool(self.last_ok_at and (now - self.last_ok_at) < 300)
+            self._token_val_cache = (now, valid)
+            return valid
 
     def _headers(self):
         if not self.access_token:
@@ -81,10 +114,17 @@ class UpstoxClient:
             r = self.session.get(url, headers=self._headers(), params=params, timeout=25)
         except requests.RequestException as exc:
             raise UpstoxError(f"Upstox request failed: {exc}") from exc
+        if r.status_code in (401, 403):
+            msg = f"Upstox HTTP {r.status_code}: {r.text[:400]}"
+            self.last_auth_error = msg
+            raise UpstoxAuthError(msg)
         if r.status_code >= 400:
             raise UpstoxError(f"Upstox HTTP {r.status_code}: {r.text[:400]}")
         try:
-            return r.json()
+            data = r.json()
+            self.last_ok_at = time.time()
+            self.last_auth_error = ""
+            return data
         except Exception as exc:
             raise UpstoxError("Upstox returned non-JSON data.") from exc
 
@@ -387,6 +427,7 @@ class LiveMarketHub:
         self._started = False
         self._connected = False
         self._run_gen = 0
+        self.reconnect_attempts = 0
         self._requested: set[str] = set()
         self._minute_bars: dict[str, dict[datetime, dict]] = {}
         self._minutes: dict[str, deque[dict]] = {}
@@ -420,10 +461,13 @@ class LiveMarketHub:
             self._started = False
             self._connected = False
             self._last_error = ""
+            self.reconnect_attempts = 0
             old_streamer = self._streamer
             self._streamer = None
         if old_streamer is not None:
             try:
+                if hasattr(old_streamer, "auto_reconnect"):
+                    old_streamer.auto_reconnect(False)
                 old_streamer.disconnect()
             except Exception:
                 pass
@@ -465,6 +509,7 @@ class LiveMarketHub:
                         if gen != self._run_gen: return
                         self._connected = True
                         self._last_error = ""
+                        self.reconnect_attempts = 0
                         keys = sorted(self._requested)
                     if keys:
                         try: streamer.subscribe(keys, "full")
@@ -481,11 +526,20 @@ class LiveMarketHub:
                         if gen == self._run_gen:
                             self._connected = False
                             self._last_error = str(err)
+                            self.reconnect_attempts += 1
+                    err_msg = str(err).lower()
+                    if any(x in err_msg for x in ("401", "403", "unauthorized", "expired")):
+                        self.upstox.last_auth_error = str(err)
 
                 def on_message(message):
+                    with self._lock:
+                        if gen != self._run_gen:
+                            return
                     try: self._ingest(message)
                     except Exception as exc:
-                        with self._lock: self._last_error = f"feed parse: {exc}"
+                        with self._lock:
+                            if gen == self._run_gen:
+                                self._last_error = f"feed parse: {exc}"
 
                 streamer.on("open", on_open)
                 streamer.on("close", on_close)

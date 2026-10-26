@@ -43,5 +43,9 @@
 .alert-banner.success{background:#effaf4;border:1px solid #b6e9cd;color:#117855}
 .banner-btn{background:var(--blue);color:#fff;border:none;padding:6px 14px;border-radius:8px;font-size:12px;font-weight:700;text-decoration:none;cursor:pointer;white-space:nowrap}
 .banner-btn:hover{opacity:.9}
+.chart-wrapper{position:relative;min-height:440px}
+.chart-wrapper .chart-empty{position:absolute;inset:0;height:100%;z-index:10;display:flex}
 .chart-empty{height:440px;display:flex;align-items:center;justify-content:center;border:1px dashed var(--border);border-radius:12px;color:var(--muted);font-size:14px;background:#fbfdff;text-align:center;padding:20px}
+.status-chip.delayed{background:#fff8eb;color:#b45309;border-color:#fcd34d}
+.pill.delayed{background:#fff8eb;color:#b45309;border-color:#fcd34d}
 

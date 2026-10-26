@@ -43,6 +43,7 @@ NSE_HOLIDAYS_SET = {
     "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", "2026-09-14",
     "2026-10-02", "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25",
 }
+NSE_HOLIDAYS_LIST = sorted(list(NSE_HOLIDAYS_SET))
 
 PRIORITY_STOCKS = [
     {"name": "SENSEX", "symbol": "SENSEX", "aliases": ["SENSEX", "BSE SENSEX"]},

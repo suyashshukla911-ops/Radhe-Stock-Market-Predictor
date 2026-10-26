@@ -1,11 +1,11 @@
 const NULL_EL={textContent:"",innerHTML:"",value:"",disabled:false,className:"",href:"",onclick:null,style:{},focus(){},scrollIntoView(){},addEventListener(){}};
 const $=id=>document.getElementById(id)||NULL_EL;
-const state={symbol:"SENSEX",interval:"1",lastAnalysis:null,lastAnalysisAt:0,busy:false,marketOpen:false,predictionCadenceMs:20000,viewToken:0,liveController:null,analysisController:null,stockSuggestController:null,stockSuggestTimer:null,authBannerActive:false,isTabVisible:!document.hidden};
+const state={symbol:"SENSEX",interval:"1",lastAnalysis:null,lastAnalysisAt:0,busy:false,marketOpen:false,predictionCadenceMs:20000,viewToken:0,liveController:null,analysisController:null,stockSuggestController:null,stockSuggestTimer:null,authBannerActive:false,isTabVisible:!document.hidden,dataStatus:"OK",holidays:[],serverWaking:false,wakeRetrySeconds:5};
 function fmt(v,d=2){return Number.isFinite(Number(v))?Number(v).toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d}):"—"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[c]))}
 async function getJSON(url,signal){const r=await fetch(url,{cache:"no-store",signal});const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){throw new Error(r.ok?"Invalid server response":`Server error ${r.status}`)}if(!r.ok)throw new Error(j.detail||"Request failed");return j}
-function candleLabel(c,seconds){if(!c)return"—";if(state.interval==="1d"){const d=new Date(c.start);return`Session ${d.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})}`}const s=new Date(c.start).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});const e=new Date(c.end).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});return c.forming?`Current candle ${s}–${e} · ${Number.isFinite(Number(seconds))?seconds:0}s left`:`Last completed candle ${s}–${e}`}
-function timeLabel(iso){const d=new Date(iso);if(Number.isNaN(d.getTime()))return String(iso);if(state.interval==="1d")return d.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});return d.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"})}
+function candleLabel(c,seconds){if(!c)return"—";if(state.interval==="1d"){const d=new Date(c.start);return`Session ${d.toLocaleDateString("en-IN",{timeZone:"Asia/Kolkata",day:"2-digit",month:"short",year:"numeric"})}`}const s=new Date(c.start).toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata",hour:"2-digit",minute:"2-digit"});const e=new Date(c.end).toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata",hour:"2-digit",minute:"2-digit"});return c.forming?`Current candle ${s}–${e} · ${Number.isFinite(Number(seconds))?seconds:0}s left`:`Last completed candle ${s}–${e}`}
+function timeLabel(iso){const d=new Date(iso);if(Number.isNaN(d.getTime()))return String(iso);if(state.interval==="1d")return d.toLocaleDateString("en-IN",{timeZone:"Asia/Kolkata",day:"2-digit",month:"short",year:"numeric"});return d.toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata",hour:"2-digit",minute:"2-digit"})}
 function candleTrace(rows,name="Actual"){
   const custom=rows.map(r=>[r.open,r.high,r.low,r.close,r.time]);
   const is1D=state.interval==="1d";
@@ -26,9 +26,13 @@ function candleTrace(rows,name="Actual"){
 }
 function chartLayout(key){
   const is1D=state.interval==="1d";
-  const rangebreaks=is1D
-    ?[{pattern:"day of week",bounds:["sat","mon"]}]
-    :[{pattern:"day of week",bounds:["sat","mon"]},{pattern:"hour",bounds:[15.5,9.25]}];
+  const rangebreaks=[{pattern:"day of week",bounds:["sat","mon"]}];
+  if(state.holidays&&state.holidays.length){
+    rangebreaks.push({values:state.holidays});
+  }
+  if(!is1D){
+    rangebreaks.push({pattern:"hour",bounds:[15.5,9.25]});
+  }
   return {
     paper_bgcolor:"#fff",
     plot_bgcolor:"#fff",
@@ -63,22 +67,34 @@ function chartLayout(key){
 }
 function drawActual(rows){
   const el=document.getElementById("actual-chart");
+  const emptyEl=document.getElementById("actual-chart-empty");
+  const msgEl=document.getElementById("actual-chart-empty-msg");
   if(!window.Plotly||!el)return;
   if(!rows?.length){
     Plotly.purge("actual-chart");
-    el.innerHTML=`<div class="chart-empty"><span>No candle data available for ${esc(state.symbol)} (${state.interval==="1d"?"1D":state.interval+"m"}). ${state.marketOpen?"Waiting for live feed…":"Market is currently closed."}</span></div>`;
+    if(emptyEl){
+      emptyEl.style.display="flex";
+      if(msgEl)msgEl.textContent=`No candle data available for ${esc(state.symbol)} (${state.interval==="1d"?"1D":state.interval+"m"}). ${state.marketOpen?"Waiting for live feed…":"Market is currently closed."}`;
+    }
     return;
   }
+  if(emptyEl)emptyEl.style.display="none";
   Plotly.react("actual-chart",[candleTrace(rows)],chartLayout(`actual-${state.symbol}-${state.interval}`),{displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:["lasso2d","select2d"]});
 }
 function drawForecast(rows){
   const el=document.getElementById("forecast-chart");
+  const emptyEl=document.getElementById("forecast-chart-empty");
+  const msgEl=document.getElementById("forecast-chart-empty-msg");
   if(!window.Plotly||!el)return;
   if(!rows?.length){
     Plotly.purge("forecast-chart");
-    el.innerHTML=`<div class="chart-empty"><span>Forecast candles will be generated during active market hours.</span></div>`;
+    if(emptyEl){
+      emptyEl.style.display="flex";
+      if(msgEl)msgEl.textContent="Forecast candles will be generated during active market hours.";
+    }
     return;
   }
+  if(emptyEl)emptyEl.style.display="none";
   const custom=rows.map(r=>[r.open,r.high,r.low,r.close,r.time]);
   const labels=rows.map(r=>`T+${r.step||1} (${timeLabel(r.time)})`);
   const trace={
@@ -112,7 +128,7 @@ function drawForecast(rows){
 function clearPrediction(){state.lastAnalysis=null;["next-close","next-high","next-low","eod-close","signal","signal-note","forecast-summary"].forEach(id=>$(id).textContent="—");$("forecast-pill").textContent="WAITING";$("forecast-pill").className="pill warn";$("gate-title").textContent="REVALIDATE";$("gate-copy").textContent="Waiting for the selected index to be analysed.";if($("validation"))$("validation").innerHTML="";if($("actual-ohlc"))$("actual-ohlc").innerHTML=`<div><span>OPEN</span><b>—</b></div><div><span>HIGH</span><b>—</b></div><div><span>LOW</span><b>—</b></div><div><span>CLOSE</span><b>—</b></div>`;drawForecast([])}
 function renderActualOHLC(c){if(!c||!$("actual-ohlc"))return;$("actual-ohlc").innerHTML=`<div><span>OPEN</span><b>${fmt(c.open)}</b></div><div><span>HIGH</span><b>${fmt(c.high)}</b></div><div><span>LOW</span><b>${fmt(c.low)}</b></div><div><span>CLOSE</span><b>${fmt(c.close)}</b></div>`}
 function renderValidation(v){if(!$("validation"))return;const items=[["Direction accuracy",`${v.direction_accuracy}%`],["Selective precision",`${v.signal_precision}%`],["Wilson lower bound",`${v.precision_lower_bound}%`],["Signal count",v.signal_count],["Training rows",v.train_rows]];$("validation").innerHTML=items.map(([a,b])=>`<div class="val"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join("")}
-function renderNews(n){const rows=(n?.display_articles||[]).slice(0,10);const toi=n?.toi||{};$("news-score").textContent=`${rows.length} top stories`;$("news-summary").innerHTML=[["Top stories",rows.length],["Source","Times of India"],["Updated",toi.fetched_at?new Date(toi.fetched_at).toLocaleTimeString("en-IN"):"—"],["Coverage",`${toi.sections_ok||0}/${toi.sections_total||0} sections`]].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");$("news-list").innerHTML=rows.map((a,i)=>`<article class="news-item"><div class="news-rank">${i+1}</div><div><a href="${esc(a.url||"#")}" target="_blank" rel="noopener">${esc(a.title||"")}</a><div class="news-meta"><span>${esc(a.section||"Markets")}</span><span>${a.scraped_at?new Date(a.scraped_at).toLocaleString("en-IN"):"Latest"}</span></div></div></article>`).join("")||`<div class="muted">Latest Times of India business and market headlines are loading.</div>`;$("news-quota").textContent=toi.fetched_at?`Latest Times of India update: ${new Date(toi.fetched_at).toLocaleString("en-IN")}: ${rows.length} top market stories shown.`:"Waiting for the latest Times of India headlines…";$("news-download").href=n?.download_url||"/api/news/download"}
+function renderNews(n){const rows=(n?.display_articles||[]).slice(0,10);const toi=n?.toi||{};$("news-score").textContent=`${rows.length} top stories`;$("news-summary").innerHTML=[["Top stories",rows.length],["Source","Times of India"],["Updated",toi.fetched_at?new Date(toi.fetched_at).toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata"}):"—"],["Coverage",`${toi.sections_ok||0}/${toi.sections_total||0} sections`]].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");$("news-list").innerHTML=rows.map((a,i)=>`<article class="news-item"><div class="news-rank">${i+1}</div><div><a href="${esc(a.url||"#")}" target="_blank" rel="noopener">${esc(a.title||"")}</a><div class="news-meta"><span>${esc(a.section||"Markets")}</span><span>${a.scraped_at?new Date(a.scraped_at).toLocaleString("en-IN",{timeZone:"Asia/Kolkata"}):"Latest"}</span></div></div></article>`).join("")||`<div class="muted">Latest Times of India business and market headlines are loading.</div>`;$("news-quota").textContent=toi.fetched_at?`Latest Times of India update: ${new Date(toi.fetched_at).toLocaleString("en-IN",{timeZone:"Asia/Kolkata"})}: ${rows.length} top market stories shown.`:"Waiting for the latest Times of India headlines…";$("news-download").href=n?.download_url||"/api/news/download"}
 function renderPulse(d){$("pulse-grid").innerHTML=(d.results||[]).slice(0,18).map(x=>`<button class="pulse-item" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name)}</span><strong class="${Number(x.change_pct)>=0?"up":"down"}">${x.change_pct==null?"—":(Number(x.change_pct)>=0?"+":"")+Number(x.change_pct).toFixed(2)+"%"}</strong><small>${x.price==null?"—":fmt(x.price)}</small></button>`).join("")||`<div class="muted">Market pulse unavailable.</div>`;document.querySelectorAll(".pulse-item").forEach(b=>b.onclick=async()=>{const sym=b.dataset.symbol;const upper=sym.toUpperCase();if(upper==="SENSEX"||upper==="NIFTY 50"){await switchTradingSymbol(upper)}else{$("stock-symbol").value=sym;$ ("stock-selection").textContent=`Selected ${sym}. Click PREDICT NEXT SESSION.`;document.querySelector(".stock-panel")?.scrollIntoView({behavior:"smooth",block:"start"})}})}
 function renderAnalysis(d){
   const sym=(d.symbol||d.instrument?.symbol||"").toUpperCase();
@@ -121,10 +137,10 @@ function renderAnalysis(d){
   const p=d.prediction,v=p.validation;
   $("actual-title").textContent=`${d.instrument?.name||sym} · ${d.interval}m`;
   $("forecast-title").textContent=`NEXT 2 ${d.interval}m CANDLES`;
-  $("forecast-label").textContent=`Model path from ${new Date(d.last_timestamp).toLocaleTimeString("en-IN")}`;
+  $("forecast-label").textContent=`Model path from ${new Date(d.last_timestamp).toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata"})}`;
   $("current").textContent=fmt(d.current_price);
   $("price-label").textContent="LIVE PRICE";
-  $("timestamp").textContent=`Live ${new Date(d.last_timestamp).toLocaleTimeString("en-IN")}`;
+  $("timestamp").textContent=`Live ${new Date(d.last_timestamp).toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata"})}`;
   $("next-close").textContent=fmt(p.predicted_close);
   $("next-high").textContent=fmt(p.predicted_high);
   $("next-low").textContent=fmt(p.predicted_low);
@@ -153,6 +169,7 @@ function renderLive(d){
   const mStatus=mkt.market_status||"UNKNOWN";
   const dStatus=mkt.data_status||"OK";
   state.marketOpen=(mStatus==="OPEN");
+  state.dataStatus=dStatus;
   const c=d.current_candle;
 
   if(c){
@@ -172,6 +189,10 @@ function renderLive(d){
       chip.className="status-chip good";
       chip.textContent="● Upstox: Connected";
       chip.href="#";
+    }else if(dStatus==="DELAYED"){
+      chip.className="status-chip delayed";
+      chip.textContent="● Feed: Delayed (>90s)";
+      chip.href="#";
     }else if(dStatus==="NO_TOKEN"||dStatus==="TOKEN_EXPIRED"){
       chip.className="status-chip bad";
       chip.textContent="○ Connect Upstox";
@@ -183,25 +204,48 @@ function renderLive(d){
     }
   }
 
+  const actualPill=$("actual-pill");
+  if(actualPill){
+    if(dStatus==="DELAYED"){
+      actualPill.textContent="DELAYED";
+      actualPill.className="pill delayed";
+    }else if(mStatus==="OPEN"){
+      actualPill.textContent="LIVE";
+      actualPill.className="pill";
+    }else{
+      actualPill.textContent="CLOSED";
+      actualPill.className="pill warn";
+    }
+  }
+
   const banner=$("alert-banner");
   if(banner&&!state.authBannerActive){
     if(dStatus==="NO_TOKEN"||dStatus==="TOKEN_EXPIRED"){
       banner.style.display="flex";
       banner.className="alert-banner error";
-      banner.innerHTML=`<span>⚠️ Upstox session disconnected or expired. Live streaming is unavailable.</span><a href="/auth/upstox/start" class="banner-btn">Connect Upstox</a>`;
+      banner.innerHTML=`<span>⚠️ Upstox session disconnected or expired (401/403). Live streaming is unavailable.</span><a href="/auth/upstox/start" class="banner-btn">Connect Upstox</a>`;
+    }else if(dStatus==="DELAYED"){
+      banner.style.display="flex";
+      banner.className="alert-banner warn";
+      banner.innerHTML=`<span>⚠️ Market data feed delayed: updates are older than 90s. Using cached quote.</span><button class="banner-btn" onclick="refreshLive()">Refresh Now</button>`;
     }else if(mStatus==="OPEN"&&dStatus==="FEED_DOWN"){
       banner.style.display="flex";
       banner.className="alert-banner warn";
       banner.innerHTML=`<span>⚠️ Upstox live feed recovering: ${esc(mkt.data_message||mkt.stream_error||"Waiting for market data")}</span><button class="banner-btn" onclick="refreshLive()">Retry Feed</button>`;
-    }else{
+    }else if(!state.serverWaking){
       banner.style.display="none";
     }
   }
 
   const statusEl=$("status");
   if(mStatus==="OPEN"){
-    statusEl.textContent=mkt.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · FEED RECOVERING";
-    statusEl.className="status live";
+    if(dStatus==="DELAYED"){
+      statusEl.textContent="○ LIVE · FEED DELAYED (>90s)";
+      statusEl.className="status closed";
+    }else{
+      statusEl.textContent=mkt.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · FEED RECOVERING";
+      statusEl.className="status live";
+    }
   }else if(mStatus==="PRE_OPEN"){
     statusEl.textContent="○ PRE-MARKET (Opens 09:15 IST)";
     statusEl.className="status closed";
@@ -260,15 +304,32 @@ async function refreshLive(){
   try{
     const d=await getJSON(`/api/live?symbol=${encodeURIComponent(symbol)}&interval=${interval}`,controller.signal);
     if(token!==state.viewToken||symbol!==state.symbol||interval!==state.interval)return d;
+    if(state.serverWaking){
+      state.serverWaking=false;
+      const b=$("alert-banner");
+      if(b&&!state.authBannerActive)b.style.display="none";
+    }
+    state.wakeRetrySeconds=5;
     renderLive(d);
     return d;
   }catch(e){
-    if(e.name!=="AbortError")throw e;
+    if(e.name!=="AbortError"){
+      state.serverWaking=true;
+      const banner=$("alert-banner");
+      if(banner&&!state.authBannerActive){
+        banner.style.display="flex";
+        banner.className="alert-banner warn";
+        banner.innerHTML=`<span>⏳ Server waking up… retrying in ${state.wakeRetrySeconds}s</span><button class="banner-btn" onclick="refreshLive()">Retry Now</button>`;
+      }
+      $("status").textContent=`SERVER WAKING UP… (${state.wakeRetrySeconds}s)`;
+      $("status").className="status closed";
+      throw e;
+    }
     return null;
   }
 }
 async function analyze(force=false){
-  if(state.busy||state.interval==="1d"||!state.marketOpen)return;
+  if(state.busy||state.interval==="1d"||!state.marketOpen||state.dataStatus!=="OK")return;
   state.busy=true;
   $("analyze").disabled=true;
   $("retrain").disabled=true;
@@ -427,12 +488,16 @@ function checkAuthParams(){
 async function boot(){
   checkAuthParams();
   try{
+    try{
+      const cfg=await getJSON('/api/config');
+      if(cfg.nse_holidays)state.holidays=cfg.nse_holidays;
+    }catch(e){}
     const h=await getJSON('/api/health');
     state.predictionCadenceMs=Math.max(10000,Number(h.prediction_refresh_seconds||20)*1000);
     state.pollMs=Math.max(3000,Number(h.live_poll_seconds||5)*1000);
     const chip=$("upstox-chip");
     if(chip){
-      if(h.upstox_connected){
+      if(h.upstox_connected&&h.token_valid){
         chip.className="status-chip good";
         chip.textContent="● Upstox: Connected";
         chip.href="#";
@@ -493,7 +558,15 @@ boot();
 
 (function loop(){
   if(state.isTabVisible){
-    refreshLive().catch(()=>{}).finally(()=>setTimeout(loop,state.pollMs||5000));
+    refreshLive()
+      .then(()=>{
+        setTimeout(loop,state.pollMs||5000);
+      })
+      .catch(()=>{
+        const wait=(state.wakeRetrySeconds||5)*1000;
+        state.wakeRetrySeconds=Math.min(30,(state.wakeRetrySeconds||5)*2);
+        setTimeout(loop,wait);
+      });
   }else{
     setTimeout(loop,5000);
   }
