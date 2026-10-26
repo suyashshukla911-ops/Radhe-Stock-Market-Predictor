@@ -18,7 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from app.config import INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES, NSE_HOLIDAYS_SET
+from app.config import CACHE_DIR, INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES, NSE_HOLIDAYS_SET
 
 try:
     import upstox_client
@@ -46,7 +46,7 @@ class UpstoxError(RuntimeError):
     pass
 
 class UpstoxClient:
-    def __init__(self, access_token: str = "", cache_dir: str = "data_cache"):
+    def __init__(self, access_token: str = "", cache_dir: Optional[str | Path] = None):
         self.access_token = access_token.strip()
         self.session = requests.Session()
         retry = Retry(
@@ -58,7 +58,7 @@ class UpstoxClient:
         adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.headers.update({"Accept": "application/json", "User-Agent": "SuyashStockMarketPredictor/3.0"})
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._instruments: list[Instrument] | None = None
         self._lock = threading.RLock()
@@ -128,20 +128,59 @@ class UpstoxClient:
         return list(unique.values())
 
     @staticmethod
-    def is_market_open(dt: Optional[datetime] = None) -> bool:
+    def market_clock_status(dt: Optional[datetime] = None) -> dict:
         if dt is None:
             dt = datetime.now(ZoneInfo(IST))
         elif dt.tzinfo is None:
             dt = dt.replace(tzinfo=ZoneInfo(IST))
         else:
             dt = dt.astimezone(ZoneInfo(IST))
-        if dt.weekday() >= 5:
-            return False
+
         date_str = dt.strftime("%Y-%m-%d")
-        if date_str in NSE_HOLIDAYS_SET:
-            return False
         minute = dt.hour * 60 + dt.minute
-        return MARKET_OPEN_MINUTES <= minute < MARKET_CLOSE_MINUTES
+
+        if dt.weekday() >= 5:
+            return {
+                "market_status": "WEEKEND",
+                "is_open": False,
+                "label": "Weekend (Market Closed)",
+                "date": date_str,
+            }
+        if date_str in NSE_HOLIDAYS_SET:
+            return {
+                "market_status": "HOLIDAY",
+                "is_open": False,
+                "label": "NSE Trading Holiday",
+                "date": date_str,
+            }
+        if minute < MARKET_OPEN_MINUTES:
+            mins_left = MARKET_OPEN_MINUTES - minute
+            return {
+                "market_status": "PRE_OPEN",
+                "is_open": False,
+                "label": f"Pre-Market (Opens in {mins_left // 60}h {mins_left % 60}m)",
+                "date": date_str,
+                "minutes_to_open": mins_left,
+            }
+        if MARKET_OPEN_MINUTES <= minute < MARKET_CLOSE_MINUTES:
+            mins_left = MARKET_CLOSE_MINUTES - minute
+            return {
+                "market_status": "OPEN",
+                "is_open": True,
+                "label": "Market Open",
+                "date": date_str,
+                "minutes_to_close": mins_left,
+            }
+        return {
+            "market_status": "CLOSED",
+            "is_open": False,
+            "label": "Market Closed (Post-Session)",
+            "date": date_str,
+        }
+
+    @classmethod
+    def is_market_open(cls, dt: Optional[datetime] = None) -> bool:
+        return cls.market_clock_status(dt)["is_open"]
 
     def load_instruments(self, force: bool = False) -> list[Instrument]:
         with self._lock:
@@ -212,7 +251,11 @@ class UpstoxClient:
     def _to_df(candles: list) -> pd.DataFrame:
         cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
         if not candles:
-            return pd.DataFrame(columns=cols)
+            empty = pd.DataFrame(columns=cols)
+            empty["timestamp"] = pd.Series(dtype="datetime64[ns, Asia/Kolkata]")
+            for c in cols[1:]:
+                empty[c] = pd.Series(dtype="float64")
+            return empty
         df = pd.DataFrame(candles, columns=cols[:len(candles[0])])
         for c in cols[1:]:
             if c in df:
@@ -222,8 +265,13 @@ class UpstoxClient:
 
     @staticmethod
     def aggregate_minutes(df: pd.DataFrame, interval: int) -> pd.DataFrame:
+        cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
         if df.empty:
-            return df.copy()
+            empty = pd.DataFrame(columns=cols)
+            empty["timestamp"] = pd.Series(dtype="datetime64[ns, Asia/Kolkata]")
+            for c in cols[1:]:
+                empty[c] = pd.Series(dtype="float64")
+            return empty
         data = df.copy().sort_values("timestamp")
         for c in ["open","high","low","close","volume"]:
             data[c] = pd.to_numeric(data[c], errors="coerce")
@@ -232,7 +280,11 @@ class UpstoxClient:
         mask = (mins >= MARKET_OPEN_MINUTES) & (mins < MARKET_CLOSE_MINUTES) & (ts.dt.dayofweek < 5)
         data = data.loc[mask].copy()
         if data.empty:
-            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
+            empty = pd.DataFrame(columns=cols)
+            empty["timestamp"] = pd.Series(dtype="datetime64[ns, Asia/Kolkata]")
+            for c in cols[1:]:
+                empty[c] = pd.Series(dtype="float64")
+            return empty
         ts = pd.to_datetime(data["timestamp"], utc=False).dt.tz_convert(IST)
         session_open = ts.dt.normalize() + pd.to_timedelta(MARKET_OPEN_MINUTES, unit="m")
         elapsed = ((ts - session_open).dt.total_seconds() // 60).astype(int)
@@ -243,7 +295,7 @@ class UpstoxClient:
             close=("close","last"), volume=("volume","sum")
         ).reset_index()
         out["oi"] = 0.0
-        return out[["timestamp","open","high","low","close","volume","oi"]].drop_duplicates("timestamp")
+        return out[cols].drop_duplicates("timestamp")
 
     def get_intraday(self, instrument_key: str, interval) -> pd.DataFrame:
         if interval == "1d":
@@ -278,12 +330,18 @@ class UpstoxClient:
                     raise
                 current_to = current_from - timedelta(days=1)
                 continue
-            frames.append(self._to_df(payload.get("data", {}).get("candles", [])))
+            chunk = self._to_df(payload.get("data", {}).get("candles", []))
+            if not chunk.empty:
+                frames.append(chunk)
             if current_from <= from_date:
                 break
             current_to = current_from - timedelta(days=1)
         if not frames:
-            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
+            empty = pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
+            empty["timestamp"] = pd.Series(dtype="datetime64[ns, Asia/Kolkata]")
+            for c in ["open","high","low","close","volume","oi"]:
+                empty[c] = pd.Series(dtype="float64")
+            return empty
         return pd.concat(frames, ignore_index=True).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
     def get_daily_history(self, instrument_key: str, calendar_days: int = 365) -> pd.DataFrame:
@@ -328,6 +386,7 @@ class LiveMarketHub:
         self._streamer = None
         self._started = False
         self._connected = False
+        self._run_gen = 0
         self._requested: set[str] = set()
         self._minute_bars: dict[str, dict[datetime, dict]] = {}
         self._minutes: dict[str, deque[dict]] = {}
@@ -345,11 +404,30 @@ class LiveMarketHub:
         with self._lock: return self._last_error
 
     def start(self):
-        if self._started or not self.upstox.access_token or upstox_client is None:
-            return
-        self._started = True
-        self._worker = threading.Thread(target=self._run, name="upstox-stream", daemon=True)
+        with self._lock:
+            if self._started or not self.upstox.access_token or upstox_client is None:
+                return
+            self._started = True
+            gen = self._run_gen
+        self._worker = threading.Thread(target=self._run, args=(gen,), name="upstox-stream", daemon=True)
         self._worker.start()
+
+    def restart(self, token: str = ""):
+        with self._lock:
+            if token:
+                self.upstox.set_access_token(token)
+            self._run_gen += 1
+            self._started = False
+            self._connected = False
+            self._last_error = ""
+            old_streamer = self._streamer
+            self._streamer = None
+        if old_streamer is not None:
+            try:
+                old_streamer.disconnect()
+            except Exception:
+                pass
+        self.start()
 
     def subscribe(self, instrument_keys: Iterable[str]):
         keys = {x for x in instrument_keys if x}
@@ -365,8 +443,11 @@ class LiveMarketHub:
             except Exception as exc:
                 with self._lock: self._last_error = str(exc)
 
-    def _run(self):
+    def _run(self, gen: int):
         while True:
+            with self._lock:
+                if gen != self._run_gen:
+                    return
             try:
                 configuration = upstox_client.Configuration()
                 configuration.access_token = self.upstox.access_token
@@ -374,10 +455,14 @@ class LiveMarketHub:
                 streamer = upstox_client.MarketDataStreamerV3(client)
                 try: streamer.auto_reconnect(True, 5, 60)
                 except Exception: pass
-                self._streamer = streamer
+                with self._lock:
+                    if gen != self._run_gen:
+                        return
+                    self._streamer = streamer
 
                 def on_open():
                     with self._lock:
+                        if gen != self._run_gen: return
                         self._connected = True
                         self._last_error = ""
                         keys = sorted(self._requested)
@@ -387,12 +472,15 @@ class LiveMarketHub:
                             with self._lock: self._last_error = str(exc)
 
                 def on_close():
-                    with self._lock: self._connected = False
+                    with self._lock:
+                        if gen == self._run_gen:
+                            self._connected = False
 
                 def on_error(err):
                     with self._lock:
-                        self._connected = False
-                        self._last_error = str(err)
+                        if gen == self._run_gen:
+                            self._connected = False
+                            self._last_error = str(err)
 
                 def on_message(message):
                     try: self._ingest(message)
@@ -407,9 +495,14 @@ class LiveMarketHub:
                 return
             except Exception as exc:
                 with self._lock:
-                    self._connected = False
-                    self._last_error = str(exc)
-                time.sleep(10)
+                    if gen == self._run_gen:
+                        self._connected = False
+                        self._last_error = str(exc)
+                for _ in range(20):
+                    with self._lock:
+                        if gen != self._run_gen:
+                            return
+                    time.sleep(0.5)
 
     @staticmethod
     def _float(v):
@@ -431,6 +524,14 @@ class LiveMarketHub:
         lo = float(bar["low"])
         cl = float(bar["close"])
         vol = float(bar.get("volume") or 0.0)
+
+        # Validate candle sanity: non-positive prices are invalid
+        if op <= 0 or hi <= 0 or lo <= 0 or cl <= 0:
+            return
+        if hi < max(op, cl):
+            hi = max(hi, op, cl)
+        if lo > min(op, cl):
+            lo = min(lo, op, cl)
 
         with self._lock:
             bars = self._minute_bars.setdefault(key, {})
@@ -517,7 +618,12 @@ class LiveMarketHub:
                 if current is not None: rows.append(dict(current))
             else:
                 rows = sorted(bars.values(), key=lambda r: r["timestamp"])
-        if not rows: return pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
+        if not rows:
+            empty = pd.DataFrame(columns=["timestamp","open","high","low","close","volume","oi"])
+            empty["timestamp"] = pd.Series(dtype="datetime64[ns, Asia/Kolkata]")
+            for c in ["open","high","low","close","volume","oi"]:
+                empty[c] = pd.Series(dtype="float64")
+            return empty
         df = pd.DataFrame(rows)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=False).dt.tz_convert(IST)
         df["oi"] = 0.0

@@ -79,3 +79,71 @@ def test_model_for_request_does_not_block_and_then_serves(tmp_path, monkeypatch)
         if (INS.instrument_key, 5) in eng.models: break
         time.sleep(0.5)
     assert eng._model_for_request(INS, 5).model is not None
+
+def test_market_clock_status():
+    ist = ZoneInfo(IST)
+    # Weekend
+    sat = datetime(2026, 10, 24, 11, 0, tzinfo=ist)
+    assert UpstoxClient.market_clock_status(sat)["market_status"] == "WEEKEND"
+    # Holiday (Ganesh Chaturthi 2026-09-14)
+    ganesh = datetime(2026, 9, 14, 11, 0, tzinfo=ist)
+    assert UpstoxClient.market_clock_status(ganesh)["market_status"] == "HOLIDAY"
+    # Pre-market Monday 08:30 IST
+    mon_pre = datetime(2026, 10, 26, 8, 30, tzinfo=ist)
+    assert UpstoxClient.market_clock_status(mon_pre)["market_status"] == "PRE_OPEN"
+    # Intraday open Monday 10:15 IST
+    mon_open = datetime(2026, 10, 26, 10, 15, tzinfo=ist)
+    assert UpstoxClient.market_clock_status(mon_open)["market_status"] == "OPEN"
+    assert UpstoxClient.market_clock_status(mon_open)["is_open"] is True
+    # Post-market close Monday 16:00 IST
+    mon_close = datetime(2026, 10, 26, 16, 0, tzinfo=ist)
+    assert UpstoxClient.market_clock_status(mon_close)["market_status"] == "CLOSED"
+
+def test_to_df_empty_has_datetime_dtype():
+    df = UpstoxClient._to_df([])
+    assert pd.api.types.is_datetime64_any_dtype(df["timestamp"])
+    # .dt.date must not raise TypeError or AttributeError
+    dates = df["timestamp"].dt.date
+    assert len(dates) == 0
+
+def test_get_historical_handles_empty_chunk(monkeypatch):
+    up = UpstoxClient("test_token")
+    hist = mock_candles(2)
+    # Return valid candles for chunk 1, empty for chunk 2
+    calls = []
+    def mock_get_json(url, params=None):
+        calls.append(url)
+        if len(calls) == 1:
+            raw_candles = [[r.timestamp.isoformat(), r.open, r.high, r.low, r.close, r.volume, 0.0] for r in hist.itertuples()]
+            return {"data": {"candles": raw_candles}}
+        return {"data": {"candles": []}}
+    monkeypatch.setattr(up, "_get_json", mock_get_json)
+    res = up.get_historical("BSE_INDEX|SENSEX", 1, date(2026, 9, 25), date(2026, 10, 26))
+    assert not res.empty
+    assert pd.api.types.is_datetime64_any_dtype(res["timestamp"])
+    assert len(res.timestamp.dt.date) > 0
+
+def test_live_market_hub_restart():
+    up = UpstoxClient("old_token")
+    hub = LiveMarketHub(up)
+    hub._connected = True
+    hub._started = True
+    hub.restart("new_token")
+    assert up.access_token == "new_token"
+    assert hub._run_gen == 1
+    assert hub._connected is False
+
+def test_live_endpoint_returns_market_status_and_data_status(monkeypatch):
+    from starlette.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)
+    # Even if resolve_symbol or Upstox raises an error, live endpoint should not return UNKNOWN market_status
+    r = client.get("/api/live?symbol=SENSEX&interval=5")
+    assert r.status_code == 200
+    data = r.json()
+    assert "market_data" in data
+    mkt = data["market_data"]
+    assert mkt["market_status"] in {"OPEN", "PRE_OPEN", "CLOSED", "WEEKEND", "HOLIDAY"}
+    assert "data_status" in mkt
+    assert mkt["data_status"] in {"OK", "NO_TOKEN", "TOKEN_EXPIRED", "FEED_DOWN", "ERROR"}
+

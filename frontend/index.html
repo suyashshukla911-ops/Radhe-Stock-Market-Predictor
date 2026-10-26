@@ -3,11 +3,21 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Suyash Stock Market Predictor</title>
-<link rel="stylesheet" href="/static/styles.css?v=suyash-v1">
+<link rel="stylesheet" href="/static/styles.css?v=suyash-v3.1">
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 </head>
 <body>
-<header class="topbar"><div><div class="brand">SUYASH STOCK MARKET PREDICTOR</div><div class="sub">Live Indian market prices · intraday predictions · market news</div></div><div id="status" class="status">CONNECTING…</div></header>
+<header class="topbar">
+  <div>
+    <div class="brand">SUYASH STOCK MARKET PREDICTOR</div>
+    <div class="sub">Live Indian market prices · intraday predictions · market news</div>
+  </div>
+  <div class="topbar-right">
+    <a id="upstox-chip" class="status-chip warn" href="/auth/upstox/start">Upstox: Checking…</a>
+    <div id="status" class="status">CONNECTING…</div>
+  </div>
+</header>
+<div id="alert-banner" class="alert-banner" style="display: none;"></div>
 <main class="shell">
 <section class="hero"><div class="hero-main"><div class="eyebrow">LIVE MARKET ENGINE</div><h1>See the market as it is happening — then compare it with the model forecast.</h1><p>The first dashboard shows the actual market candle from the live feed. The second dashboard shows the next two modelled candles. The end-of-day outlook is fixed from the morning model and does not drift with later price moves.</p><div class="market-strip"><span id="market-dot" class="live-dot"></span><b id="feed-age">—</b><span>data age</span><span class="divider"></span><b id="candle-clock">—</b></div></div><div class="hero-side"><div class="small-label">MODEL STATUS</div><strong id="gate-title">REVALIDATE</strong><span id="gate-copy">A forecast is displayed only when the model has sufficient real market history. BUY/SELL is never forced.</span><div id="validation" class="validation-strip"></div><span class="fine">Analytics only. No orders are placed by this application.</span></div></section>
 <section class="control-card"><div class="field search"><label>Trading index</label><select id="symbol"><option value="SENSEX" selected>SENSEX</option><option value="NIFTY 50">NIFTY 50</option></select><div class="hint">Intraday trading dashboard: SENSEX and NIFTY 50 only. Listed equities use the next-session forecast section below.</div></div><div class="field small"><label>Timeframe</label><select id="interval"><option value="1" selected>1m</option><option value="5">5m</option><option value="10">10m</option><option value="15">15m</option><option value="30">30m</option><option value="60">60m</option><option value="1d">1D · previous session</option></select></div><button id="analyze" class="btn primary">ANALYZE</button><button id="retrain" class="btn ghost">RETRAIN MODEL</button></section>
@@ -19,5 +29,5 @@
 <section class="panel universe-panel"><div class="panel-head"><div><h2>Search stocks &amp; indices</h2><span class="muted">Search the full Upstox listed-equity directory.</span></div><div id="universe-badge" class="pill">DIRECTORY —</div></div><div class="universe-controls"><input id="universe-search" placeholder="Search symbol or company"><button id="universe-search-btn" class="btn ghost">SEARCH</button></div><div id="search-status" class="search-status" aria-live="polite"></div><div id="universe-results" class="universe-results"></div></section>
 <footer><span>Live market data, current-session candles, two-candle forecast, fixed morning EOD outlook and market news.</span><span>Predictions are analytical only.</span></footer>
 </main>
-<script src="/static/app.js?v=suyash-v1"></script>
+<script src="/static/app.js?v=suyash-v3.1"></script>
 </body></html>

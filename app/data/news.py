@@ -14,7 +14,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from zoneinfo import ZoneInfo
 
-from app.config import IST, settings
+from app.config import CACHE_DIR, IST, settings
 from app.data.toi import TOIBackground
 from app.data.moneycontrol import MoneyControlBackground
 
@@ -248,17 +248,18 @@ class NewsService:
     BASE = "https://api.freenewsapi.io/v1/news"
     X_BASE = "https://api.x.com/2/tweets/search/recent"
 
-    def __init__(self, api_key: str = "", max_records: int = 20, state_dir: str = "data_cache"):
+    def __init__(self, api_key: str = "", max_records: int = 20, state_dir: str | Path | None = None):
         self.api_key = api_key.strip()
         self.max_records = max_records
+        state_dir_str = str(state_dir) if state_dir is not None else str(CACHE_DIR)
         retry = Retry(total=2, backoff_factor=0.5, status_forcelist=(429,500,502,503,504), allowed_methods=frozenset({"GET"}), respect_retry_after_header=True)
         self.session = requests.Session()
         self.session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
         self.session.headers.update({"User-Agent":"SuyashStockMarketPredictor/3.0"})
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float,list[dict]]] = {}
-        self._toi = TOIBackground(settings.toi_refresh_minutes, state_dir=state_dir)
-        self._moneycontrol = MoneyControlBackground(settings.moneycontrol_refresh_minutes, state_dir=state_dir)
+        self._toi = TOIBackground(settings.toi_refresh_minutes, state_dir=state_dir_str)
+        self._moneycontrol = MoneyControlBackground(settings.moneycontrol_refresh_minutes, state_dir=state_dir_str)
         self._x_cache: tuple[float,list[dict]] | None = None
         self.quota = NewsQuota(datetime.now(ZoneInfo(IST)).strftime("%Y-%m-%d"))
         self.last_api_error = ""

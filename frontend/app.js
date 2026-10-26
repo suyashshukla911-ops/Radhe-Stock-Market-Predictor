@@ -1,36 +1,517 @@
 const NULL_EL={textContent:"",innerHTML:"",value:"",disabled:false,className:"",href:"",onclick:null,style:{},focus(){},scrollIntoView(){},addEventListener(){}};
 const $=id=>document.getElementById(id)||NULL_EL;
-const state={symbol:"SENSEX",interval:"1",lastAnalysis:null,lastAnalysisAt:0,busy:false,marketOpen:false,predictionCadenceMs:20000,viewToken:0,liveController:null,analysisController:null,stockSuggestController:null,stockSuggestTimer:null};
+const state={symbol:"SENSEX",interval:"1",lastAnalysis:null,lastAnalysisAt:0,busy:false,marketOpen:false,predictionCadenceMs:20000,viewToken:0,liveController:null,analysisController:null,stockSuggestController:null,stockSuggestTimer:null,authBannerActive:false,isTabVisible:!document.hidden};
 function fmt(v,d=2){return Number.isFinite(Number(v))?Number(v).toLocaleString("en-IN",{minimumFractionDigits:d,maximumFractionDigits:d}):"—"}
 function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[c]))}
 async function getJSON(url,signal){const r=await fetch(url,{cache:"no-store",signal});const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){throw new Error(r.ok?"Invalid server response":`Server error ${r.status}`)}if(!r.ok)throw new Error(j.detail||"Request failed");return j}
-function candleLabel(c,seconds){if(!c)return"—";const s=new Date(c.start).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});const e=new Date(c.end).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});return c.forming?`Current candle ${s}–${e} · ${Number.isFinite(Number(seconds))?seconds:0}s left`:`Last completed candle ${s}–${e}`}
-function timeLabel(iso){const d=new Date(iso);if(Number.isNaN(d.getTime()))return String(iso);if(state.interval==="1d")return d.toLocaleDateString("en-IN",{day:"2-digit",month:"short"});return d.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"})}
+function candleLabel(c,seconds){if(!c)return"—";if(state.interval==="1d"){const d=new Date(c.start);return`Session ${d.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})}`}const s=new Date(c.start).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});const e=new Date(c.end).toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});return c.forming?`Current candle ${s}–${e} · ${Number.isFinite(Number(seconds))?seconds:0}s left`:`Last completed candle ${s}–${e}`}
+function timeLabel(iso){const d=new Date(iso);if(Number.isNaN(d.getTime()))return String(iso);if(state.interval==="1d")return d.toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"});return d.toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"})}
 function candleTrace(rows,name="Actual"){
   const custom=rows.map(r=>[r.open,r.high,r.low,r.close,r.time]);
-  const labels=rows.map(r=>timeLabel(r.time));
-  return {x:labels,open:rows.map(r=>r.open),high:rows.map(r=>r.high),low:rows.map(r=>r.low),close:rows.map(r=>r.close),customdata:custom,type:"candlestick",name,whiskerwidth:0.8,increasing:{line:{color:"#079669",width:2},fillcolor:"#8bd6b9"},decreasing:{line:{color:"#d64550",width:2},fillcolor:"#f2a4ad"},hovertemplate:"<b>%{customdata[4]}</b><br>Open: %{customdata[0]:,.2f}<br>High: %{customdata[1]:,.2f}<br>Low: %{customdata[2]:,.2f}<br>Close: %{customdata[3]:,.2f}<extra></extra>"}
+  const is1D=state.interval==="1d";
+  return {
+    x:rows.map(r=>r.time),
+    open:rows.map(r=>r.open),
+    high:rows.map(r=>r.high),
+    low:rows.map(r=>r.low),
+    close:rows.map(r=>r.close),
+    customdata:custom,
+    type:"candlestick",
+    name,
+    whiskerwidth:0.8,
+    increasing:{line:{color:"#079669",width:2},fillcolor:"#8bd6b9"},
+    decreasing:{line:{color:"#d64550",width:2},fillcolor:"#f2a4ad"},
+    hovertemplate:is1D?"<b>%{x|%d %b %Y}</b><br>Open: %{open:,.2f}<br>High: %{high:,.2f}<br>Low: %{low:,.2f}<br>Close: %{close:,.2f}<extra></extra>":"<b>%{x|%d %b %Y %H:%M}</b><br>Open: %{open:,.2f}<br>High: %{high:,.2f}<br>Low: %{low:,.2f}<br>Close: %{close:,.2f}<extra></extra>"
+  };
 }
-function chartLayout(key){return {paper_bgcolor:"#fff",plot_bgcolor:"#fff",margin:{l:72,r:20,t:18,b:54},height:510,dragmode:"pan",uirevision:key,xaxis:{type:"category",rangeslider:{visible:false},gridcolor:"#e4eaf0",fixedrange:false,tickangle:0,showspikes:true,spikemode:"across",spikesnap:"cursor"},yaxis:{gridcolor:"#e4eaf0",fixedrange:false,tickformat:",.2f",exponentformat:"none",showexponent:false,separatethousands:true,showspikes:false,zeroline:false},showlegend:false,hovermode:"x unified"}}
-function drawActual(rows){if(!window.Plotly||!document.getElementById("actual-chart"))return;if(!rows?.length){Plotly.purge("actual-chart");return}Plotly.react("actual-chart",[candleTrace(rows)],chartLayout(`actual-${state.symbol}-${state.interval}`),{displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:["lasso2d","select2d"]})}
-function drawForecast(rows){if(!window.Plotly||!document.getElementById("forecast-chart"))return;if(!rows?.length){Plotly.purge("forecast-chart");return}const custom=rows.map(r=>[r.open,r.high,r.low,r.close,r.time]);const labels=rows.map(r=>`T+${r.step||1} · ${timeLabel(r.time)}`);const trace={x:labels,open:rows.map(r=>r.open),high:rows.map(r=>r.high),low:rows.map(r=>r.low),close:rows.map(r=>r.close),customdata:custom,type:"candlestick",name:"Forecast",whiskerwidth:0.8,increasing:{line:{color:"#2563eb",width:2},fillcolor:"#a9c7ff"},decreasing:{line:{color:"#ef4444",width:2},fillcolor:"#fecaca"},hovertemplate:"<b>Predicted %{customdata[4]}</b><br>Open: %{customdata[0]:,.2f}<br>High: %{customdata[1]:,.2f}<br>Low: %{customdata[2]:,.2f}<br>Close: %{customdata[3]:,.2f}<extra></extra>"};Plotly.react("forecast-chart",[trace],chartLayout(`forecast-${state.symbol}-${state.interval}-${rows[0]?.time||""}`),{displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:["lasso2d","select2d"]})}
+function chartLayout(key){
+  const is1D=state.interval==="1d";
+  const rangebreaks=is1D
+    ?[{pattern:"day of week",bounds:["sat","mon"]}]
+    :[{pattern:"day of week",bounds:["sat","mon"]},{pattern:"hour",bounds:[15.5,9.25]}];
+  return {
+    paper_bgcolor:"#fff",
+    plot_bgcolor:"#fff",
+    margin:{l:72,r:20,t:18,b:54},
+    height:510,
+    dragmode:"pan",
+    uirevision:key,
+    xaxis:{
+      type:"date",
+      rangeslider:{visible:false},
+      rangebreaks:rangebreaks,
+      gridcolor:"#e4eaf0",
+      fixedrange:false,
+      tickangle:0,
+      showspikes:true,
+      spikemode:"across",
+      spikesnap:"cursor"
+    },
+    yaxis:{
+      gridcolor:"#e4eaf0",
+      fixedrange:false,
+      tickformat:",.2f",
+      exponentformat:"none",
+      showexponent:false,
+      separatethousands:true,
+      showspikes:false,
+      zeroline:false
+    },
+    showlegend:false,
+    hovermode:"x unified"
+  };
+}
+function drawActual(rows){
+  const el=document.getElementById("actual-chart");
+  if(!window.Plotly||!el)return;
+  if(!rows?.length){
+    Plotly.purge("actual-chart");
+    el.innerHTML=`<div class="chart-empty"><span>No candle data available for ${esc(state.symbol)} (${state.interval==="1d"?"1D":state.interval+"m"}). ${state.marketOpen?"Waiting for live feed…":"Market is currently closed."}</span></div>`;
+    return;
+  }
+  Plotly.react("actual-chart",[candleTrace(rows)],chartLayout(`actual-${state.symbol}-${state.interval}`),{displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:["lasso2d","select2d"]});
+}
+function drawForecast(rows){
+  const el=document.getElementById("forecast-chart");
+  if(!window.Plotly||!el)return;
+  if(!rows?.length){
+    Plotly.purge("forecast-chart");
+    el.innerHTML=`<div class="chart-empty"><span>Forecast candles will be generated during active market hours.</span></div>`;
+    return;
+  }
+  const custom=rows.map(r=>[r.open,r.high,r.low,r.close,r.time]);
+  const labels=rows.map(r=>`T+${r.step||1} (${timeLabel(r.time)})`);
+  const trace={
+    x:labels,
+    open:rows.map(r=>r.open),
+    high:rows.map(r=>r.high),
+    low:rows.map(r=>r.low),
+    close:rows.map(r=>r.close),
+    customdata:custom,
+    type:"candlestick",
+    name:"Forecast",
+    whiskerwidth:0.8,
+    increasing:{line:{color:"#2563eb",width:2},fillcolor:"#a9c7ff"},
+    decreasing:{line:{color:"#ef4444",width:2},fillcolor:"#fecaca"},
+    hovertemplate:"<b>%{x}</b><br>Open: %{customdata[0]:,.2f}<br>High: %{customdata[1]:,.2f}<br>Low: %{customdata[2]:,.2f}<br>Close: %{customdata[3]:,.2f}<extra></extra>"
+  };
+  const layout={
+    paper_bgcolor:"#fff",
+    plot_bgcolor:"#fff",
+    margin:{l:72,r:20,t:18,b:54},
+    height:510,
+    dragmode:"pan",
+    uirevision:`forecast-${state.symbol}-${state.interval}`,
+    xaxis:{type:"category",rangeslider:{visible:false},gridcolor:"#e4eaf0"},
+    yaxis:{gridcolor:"#e4eaf0",fixedrange:false,tickformat:",.2f",exponentformat:"none",showexponent:false,separatethousands:true,zeroline:false},
+    showlegend:false,
+    hovermode:"x unified"
+  };
+  Plotly.react("forecast-chart",[trace],layout,{displaylogo:false,responsive:true});
+}
 function clearPrediction(){state.lastAnalysis=null;["next-close","next-high","next-low","eod-close","signal","signal-note","forecast-summary"].forEach(id=>$(id).textContent="—");$("forecast-pill").textContent="WAITING";$("forecast-pill").className="pill warn";$("gate-title").textContent="REVALIDATE";$("gate-copy").textContent="Waiting for the selected index to be analysed.";if($("validation"))$("validation").innerHTML="";if($("actual-ohlc"))$("actual-ohlc").innerHTML=`<div><span>OPEN</span><b>—</b></div><div><span>HIGH</span><b>—</b></div><div><span>LOW</span><b>—</b></div><div><span>CLOSE</span><b>—</b></div>`;drawForecast([])}
 function renderActualOHLC(c){if(!c||!$("actual-ohlc"))return;$("actual-ohlc").innerHTML=`<div><span>OPEN</span><b>${fmt(c.open)}</b></div><div><span>HIGH</span><b>${fmt(c.high)}</b></div><div><span>LOW</span><b>${fmt(c.low)}</b></div><div><span>CLOSE</span><b>${fmt(c.close)}</b></div>`}
 function renderValidation(v){if(!$("validation"))return;const items=[["Direction accuracy",`${v.direction_accuracy}%`],["Selective precision",`${v.signal_precision}%`],["Wilson lower bound",`${v.precision_lower_bound}%`],["Signal count",v.signal_count],["Training rows",v.train_rows]];$("validation").innerHTML=items.map(([a,b])=>`<div class="val"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join("")}
 function renderNews(n){const rows=(n?.display_articles||[]).slice(0,10);const toi=n?.toi||{};$("news-score").textContent=`${rows.length} top stories`;$("news-summary").innerHTML=[["Top stories",rows.length],["Source","Times of India"],["Updated",toi.fetched_at?new Date(toi.fetched_at).toLocaleTimeString("en-IN"):"—"],["Coverage",`${toi.sections_ok||0}/${toi.sections_total||0} sections`]].map(([a,b])=>`<div><b>${esc(b)}</b><span>${esc(a)}</span></div>`).join("");$("news-list").innerHTML=rows.map((a,i)=>`<article class="news-item"><div class="news-rank">${i+1}</div><div><a href="${esc(a.url||"#")}" target="_blank" rel="noopener">${esc(a.title||"")}</a><div class="news-meta"><span>${esc(a.section||"Markets")}</span><span>${a.scraped_at?new Date(a.scraped_at).toLocaleString("en-IN"):"Latest"}</span></div></div></article>`).join("")||`<div class="muted">Latest Times of India business and market headlines are loading.</div>`;$("news-quota").textContent=toi.fetched_at?`Latest Times of India update: ${new Date(toi.fetched_at).toLocaleString("en-IN")}: ${rows.length} top market stories shown.`:"Waiting for the latest Times of India headlines…";$("news-download").href=n?.download_url||"/api/news/download"}
 function renderPulse(d){$("pulse-grid").innerHTML=(d.results||[]).slice(0,18).map(x=>`<button class="pulse-item" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name)}</span><strong class="${Number(x.change_pct)>=0?"up":"down"}">${x.change_pct==null?"—":(Number(x.change_pct)>=0?"+":"")+Number(x.change_pct).toFixed(2)+"%"}</strong><small>${x.price==null?"—":fmt(x.price)}</small></button>`).join("")||`<div class="muted">Market pulse unavailable.</div>`;document.querySelectorAll(".pulse-item").forEach(b=>b.onclick=async()=>{const sym=b.dataset.symbol;const upper=sym.toUpperCase();if(upper==="SENSEX"||upper==="NIFTY 50"){await switchTradingSymbol(upper)}else{$("stock-symbol").value=sym;$ ("stock-selection").textContent=`Selected ${sym}. Click PREDICT NEXT SESSION.`;document.querySelector(".stock-panel")?.scrollIntoView({behavior:"smooth",block:"start"})}})}
-function renderAnalysis(d){const sym=(d.symbol||d.instrument?.symbol||"").toUpperCase();if(sym!==state.symbol.toUpperCase()||String(d.interval)!==String(state.interval))return;state.lastAnalysis=d;const p=d.prediction,v=p.validation;$("actual-title").textContent=`${d.instrument?.name||sym} · ${d.interval}m`;$("forecast-title").textContent=`NEXT 2 ${d.interval}m CANDLES`;$("forecast-label").textContent=`Model path from ${new Date(d.last_timestamp).toLocaleTimeString("en-IN")}`;$("current").textContent=fmt(d.current_price);$("price-label").textContent="LIVE PRICE";$("timestamp").textContent=`Live ${new Date(d.last_timestamp).toLocaleTimeString("en-IN")}`;$("next-close").textContent=fmt(p.predicted_close);$("next-high").textContent=fmt(p.predicted_high);$("next-low").textContent=fmt(p.predicted_low);$("next-close-note").textContent=`selected ${d.interval}m forecast`;$ ("next-high-note").textContent="model estimate";$ ("next-low-note").textContent="model estimate";$("eod-close").textContent=fmt(d.morning_outlook.eod_close);$("eod-note").textContent=`fixed morning outlook ${d.morning_outlook.change_pct>=0?"+":""}${d.morning_outlook.change_pct}%`;$("signal").textContent=p.signal;$("signal-note").textContent=p.signal==="REVALIDATE"?"Validation gate not statistically sufficient":"Signal eligible";$("gate-title").textContent=v.gate_90_passed?"SIGNAL ELIGIBLE":"REVALIDATE";$("gate-copy").textContent=`Measured selective precision ${v.signal_precision}% · Wilson lower bound ${v.precision_lower_bound}%.`;$("forecast-pill").textContent=`UP ${(p.probability_up*100).toFixed(1)}%`;$("forecast-pill").className=`pill ${p.probability_up>=.65?"good":p.probability_up<=.35?"bad":"warn"}`;const f=d.forecast_candles||[];$("forecast-summary").innerHTML=f.map((c,i)=>`<div class="forecast-line"><b>Forecast ${i+1}</b><span>O ${fmt(c.open)} · H ${fmt(c.high)} · L ${fmt(c.low)} · C ${fmt(c.close)}</span></div>`).join("")+`<div class="forecast-lock">EOD fixed: <b>${fmt(d.morning_outlook.eod_close)}</b></div>`;renderValidation(v);drawActual(d.actual_candles);drawForecast(f);if(d.actual_candles?.length)renderActualOHLC(d.actual_candles[d.actual_candles.length-1]);state.lastAnalysisAt=Date.now()}
-function renderLive(d){const status=d.market_data?.market_status||"UNKNOWN";state.marketOpen=status==="OPEN";const c=d.current_candle;if(c){$("actual-label").textContent=candleLabel(c,d.seconds_to_candle_close);$("candle-clock").textContent=candleLabel(c,d.seconds_to_candle_close);$("actual-title").textContent=`${d.symbol} · ${state.interval==="1d"?"1D":state.interval+"m"}`;$("feed-age").textContent=d.market_data?.last_update_age_seconds==null?"—":`${Number(d.market_data.last_update_age_seconds).toFixed(1)}s`;renderActualOHLC(c)}if(d.tick?.price!=null)$("current").textContent=fmt(d.tick.price);else if(d.market_data?.last_market_price!=null)$("current").textContent=fmt(d.market_data.last_market_price);$("status").textContent=status==="OPEN"?(d.market_data.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · FEED RECOVERING"):"● MARKET CLOSED · LAST COMPLETED SESSION";$("status").className=status==="OPEN"?"status live":"status closed";let actualRows=[...(d.candles||[])];if(c){const row={time:c.start,open:c.open,high:c.high,low:c.low,close:c.close};const idx=actualRows.findIndex(r=>r.time===c.start);if(idx>=0)actualRows[idx]=row;else actualRows.push(row)}drawActual(actualRows);if(status!=="OPEN"){$("price-label").textContent=state.interval==="1d"?"PREVIOUS SESSION CLOSE":"LAST SESSION PRICE";if(c){$("next-close").textContent=fmt(c.close);$("next-high").textContent=fmt(c.high);$("next-low").textContent=fmt(c.low);$("next-close-title").textContent="LAST CANDLE CLOSE";$("next-high-title").textContent="LAST CANDLE HIGH";$("next-low-title").textContent="LAST CANDLE LOW";$("next-close-note").textContent="completed market candle";$("next-high-note").textContent="completed market candle";$("next-low-note").textContent="completed market candle"}$("signal").textContent=state.interval==="1d"?"HISTORY":"MARKET CLOSED";$("signal-note").textContent="Forecast resumes during market hours";$("forecast-pill").textContent="CLOSED";$("forecast-summary").textContent="Predictions are frozen after the close. The actual market chart remains viewable.";drawForecast([])}else{$("price-label").textContent="LIVE PRICE";$("next-close-title").textContent="NEXT CANDLE CLOSE";$("next-high-title").textContent="NEXT CANDLE HIGH";$("next-low-title").textContent="NEXT CANDLE LOW"}}
-async function refreshLive(){const token=state.viewToken;const symbol=state.symbol;const interval=state.interval;state.liveController?.abort();const controller=new AbortController();state.liveController=controller;try{const d=await getJSON(`/api/live?symbol=${encodeURIComponent(symbol)}&interval=${interval}`,controller.signal);if(token!==state.viewToken||symbol!==state.symbol||interval!==state.interval)return d;renderLive(d);return d}catch(e){if(e.name!=="AbortError")throw e;return null}}
-async function analyze(force=false){if(state.busy||state.interval==="1d"||!state.marketOpen)return;state.busy=true;$ ("analyze").disabled=true;$ ("retrain").disabled=true;const token=state.viewToken;const symbol=state.symbol;const interval=state.interval;state.analysisController?.abort();const controller=new AbortController();state.analysisController=controller;$ ("status").textContent=force?`RETRAINING ${symbol}…`:`UPDATING ${symbol}…`;try{const d=await getJSON(`/api/analyze?symbol=${encodeURIComponent(symbol)}&interval=${interval}&retrain=${force}`,controller.signal);if(token!==state.viewToken||symbol!==state.symbol||interval!==state.interval)return;renderAnalysis(d);$("status").textContent=d.market_state.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · FEED RECOVERING";$("status").className="status live"}catch(e){if(e.name!=="AbortError"){$("status").textContent=`MODEL: ${e.message}`;$ ("status").className="status error"}}finally{if(token===state.viewToken){state.busy=false;$ ("analyze").disabled=false;$ ("retrain").disabled=false}}}
-async function switchTradingSymbol(next){const target=(next||"SENSEX").toUpperCase()==="NIFTY 50"?"NIFTY 50":"SENSEX";state.viewToken++;state.busy=false;state.analysisController?.abort();state.liveController?.abort();state.symbol=target;$("symbol").value=target;clearPrediction();$("status").textContent=`SWITCHING TO ${target}…`;$("status").className="status live";await refreshLive();if(state.marketOpen&&state.interval!=="1d")await analyze(false)}
-async function pulse(){try{renderPulse(await getJSON("/api/market-pulse?limit=30"))}catch(e){$("pulse-grid").innerHTML=`<div class="muted">Market pulse unavailable.</div>`}}
-async function newsRefresh(){try{renderNews(await getJSON(`/api/news?symbol=${encodeURIComponent(state.symbol)}&name=${encodeURIComponent(state.symbol)}`))}catch(e){$("news-quota").textContent=`Market news unavailable: ${e.message}`}}
-async function manualNewsRefresh(){const b=$("news-refresh");b.disabled=true;b.textContent="REFRESHING…";try{await getJSON("/api/news/refresh");await newsRefresh()}catch(e){$("news-quota").textContent=`News refresh failed: ${e.message}`}finally{b.disabled=false;b.textContent="REFRESH NEWS"}}
+function renderAnalysis(d){
+  const sym=(d.symbol||d.instrument?.symbol||"").toUpperCase();
+  if(sym!==state.symbol.toUpperCase()||String(d.interval)!==String(state.interval))return;
+  state.lastAnalysis=d;
+  const p=d.prediction,v=p.validation;
+  $("actual-title").textContent=`${d.instrument?.name||sym} · ${d.interval}m`;
+  $("forecast-title").textContent=`NEXT 2 ${d.interval}m CANDLES`;
+  $("forecast-label").textContent=`Model path from ${new Date(d.last_timestamp).toLocaleTimeString("en-IN")}`;
+  $("current").textContent=fmt(d.current_price);
+  $("price-label").textContent="LIVE PRICE";
+  $("timestamp").textContent=`Live ${new Date(d.last_timestamp).toLocaleTimeString("en-IN")}`;
+  $("next-close").textContent=fmt(p.predicted_close);
+  $("next-high").textContent=fmt(p.predicted_high);
+  $("next-low").textContent=fmt(p.predicted_low);
+  $("next-close-note").textContent=`selected ${d.interval}m forecast`;
+  $("next-high-note").textContent="model estimate";
+  $("next-low-note").textContent="model estimate";
+  $("eod-close").textContent=fmt(d.morning_outlook.eod_close);
+  const lateStr=d.morning_outlook.late?` (Locked late ${d.morning_outlook.locked_at_time||""})`:"";
+  $("eod-note").textContent=`fixed morning outlook ${d.morning_outlook.change_pct>=0?"+":""}${d.morning_outlook.change_pct}%${lateStr}`;
+  $("signal").textContent=p.signal;
+  $("signal-note").textContent=p.signal==="REVALIDATE"?"Validation gate not statistically sufficient":"Signal eligible";
+  $("gate-title").textContent=v.gate_90_passed?"SIGNAL ELIGIBLE":"REVALIDATE";
+  $("gate-copy").textContent=`Measured selective precision ${v.signal_precision}% · Wilson lower bound ${v.precision_lower_bound}%.`;
+  $("forecast-pill").textContent=`UP ${(p.probability_up*100).toFixed(1)}%`;
+  $("forecast-pill").className=`pill ${p.probability_up>=.65?"good":p.probability_up<=.35?"bad":"warn"}`;
+  const f=d.forecast_candles||[];
+  $("forecast-summary").innerHTML=f.map((c,i)=>`<div class="forecast-line"><b>Forecast ${i+1}</b><span>O ${fmt(c.open)} · H ${fmt(c.high)} · L ${fmt(c.low)} · C ${fmt(c.close)}</span></div>`).join("")+`<div class="forecast-lock">EOD fixed: <b>${fmt(d.morning_outlook.eod_close)}</b>${lateStr}</div>`;
+  renderValidation(v);
+  drawActual(d.actual_candles);
+  drawForecast(f);
+  if(d.actual_candles?.length)renderActualOHLC(d.actual_candles[d.actual_candles.length-1]);
+  state.lastAnalysisAt=Date.now();
+}
+function renderLive(d){
+  const mkt=d.market_data||{};
+  const mStatus=mkt.market_status||"UNKNOWN";
+  const dStatus=mkt.data_status||"OK";
+  state.marketOpen=(mStatus==="OPEN");
+  const c=d.current_candle;
+
+  if(c){
+    $("actual-label").textContent=candleLabel(c,d.seconds_to_candle_close);
+    $("candle-clock").textContent=candleLabel(c,d.seconds_to_candle_close);
+    $("actual-title").textContent=`${d.symbol} · ${state.interval==="1d"?"1D":state.interval+"m"}`;
+    $("feed-age").textContent=mkt.last_update_age_seconds==null?"—":`${Number(mkt.last_update_age_seconds).toFixed(1)}s`;
+    renderActualOHLC(c);
+  }
+
+  if(d.tick?.price!=null)$("current").textContent=fmt(d.tick.price);
+  else if(mkt.last_market_price!=null)$("current").textContent=fmt(mkt.last_market_price);
+
+  const chip=$("upstox-chip");
+  if(chip){
+    if(dStatus==="OK"){
+      chip.className="status-chip good";
+      chip.textContent="● Upstox: Connected";
+      chip.href="#";
+    }else if(dStatus==="NO_TOKEN"||dStatus==="TOKEN_EXPIRED"){
+      chip.className="status-chip bad";
+      chip.textContent="○ Connect Upstox";
+      chip.href="/auth/upstox/start";
+    }else{
+      chip.className="status-chip warn";
+      chip.textContent="● Upstox: Checking…";
+      chip.href="/auth/upstox/start";
+    }
+  }
+
+  const banner=$("alert-banner");
+  if(banner&&!state.authBannerActive){
+    if(dStatus==="NO_TOKEN"||dStatus==="TOKEN_EXPIRED"){
+      banner.style.display="flex";
+      banner.className="alert-banner error";
+      banner.innerHTML=`<span>⚠️ Upstox session disconnected or expired. Live streaming is unavailable.</span><a href="/auth/upstox/start" class="banner-btn">Connect Upstox</a>`;
+    }else if(mStatus==="OPEN"&&dStatus==="FEED_DOWN"){
+      banner.style.display="flex";
+      banner.className="alert-banner warn";
+      banner.innerHTML=`<span>⚠️ Upstox live feed recovering: ${esc(mkt.data_message||mkt.stream_error||"Waiting for market data")}</span><button class="banner-btn" onclick="refreshLive()">Retry Feed</button>`;
+    }else{
+      banner.style.display="none";
+    }
+  }
+
+  const statusEl=$("status");
+  if(mStatus==="OPEN"){
+    statusEl.textContent=mkt.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · FEED RECOVERING";
+    statusEl.className="status live";
+  }else if(mStatus==="PRE_OPEN"){
+    statusEl.textContent="○ PRE-MARKET (Opens 09:15 IST)";
+    statusEl.className="status closed";
+  }else if(mStatus==="HOLIDAY"){
+    statusEl.textContent="● MARKET CLOSED · NSE HOLIDAY";
+    statusEl.className="status closed";
+  }else if(mStatus==="WEEKEND"){
+    statusEl.textContent="● MARKET CLOSED · WEEKEND";
+    statusEl.className="status closed";
+  }else{
+    statusEl.textContent="● MARKET CLOSED · LAST COMPLETED SESSION";
+    statusEl.className="status closed";
+  }
+
+  let actualRows=[...(d.candles||[])];
+  if(c){
+    const row={time:c.start,open:c.open,high:c.high,low:c.low,close:c.close};
+    const idx=actualRows.findIndex(r=>r.time===c.start);
+    if(idx>=0)actualRows[idx]=row;
+    else actualRows.push(row);
+  }
+  drawActual(actualRows);
+
+  if(!state.marketOpen){
+    $("price-label").textContent=state.interval==="1d"?"PREVIOUS SESSION CLOSE":"LAST SESSION PRICE";
+    if(c){
+      $("next-close").textContent=fmt(c.close);
+      $("next-high").textContent=fmt(c.high);
+      $("next-low").textContent=fmt(c.low);
+      $("next-close-title").textContent="LAST CANDLE CLOSE";
+      $("next-high-title").textContent="LAST CANDLE HIGH";
+      $("next-low-title").textContent="LAST CANDLE LOW";
+      $("next-close-note").textContent="completed market candle";
+      $("next-high-note").textContent="completed market candle";
+      $("next-low-note").textContent="completed market candle";
+    }
+    $("signal").textContent=state.interval==="1d"?"HISTORY":"MARKET CLOSED";
+    $("signal-note").textContent="Forecast resumes during market hours";
+    $("forecast-pill").textContent="CLOSED";
+    $("forecast-summary").textContent="Predictions are frozen after the close. The actual market chart remains viewable.";
+    drawForecast([]);
+  }else{
+    $("price-label").textContent="LIVE PRICE";
+    $("next-close-title").textContent="NEXT CANDLE CLOSE";
+    $("next-high-title").textContent="NEXT CANDLE HIGH";
+    $("next-low-title").textContent="NEXT CANDLE LOW";
+  }
+}
+async function refreshLive(){
+  const token=state.viewToken;
+  const symbol=state.symbol;
+  const interval=state.interval;
+  state.liveController?.abort();
+  const controller=new AbortController();
+  state.liveController=controller;
+  try{
+    const d=await getJSON(`/api/live?symbol=${encodeURIComponent(symbol)}&interval=${interval}`,controller.signal);
+    if(token!==state.viewToken||symbol!==state.symbol||interval!==state.interval)return d;
+    renderLive(d);
+    return d;
+  }catch(e){
+    if(e.name!=="AbortError")throw e;
+    return null;
+  }
+}
+async function analyze(force=false){
+  if(state.busy||state.interval==="1d"||!state.marketOpen)return;
+  state.busy=true;
+  $("analyze").disabled=true;
+  $("retrain").disabled=true;
+  const token=state.viewToken;
+  const symbol=state.symbol;
+  const interval=state.interval;
+  state.analysisController?.abort();
+  const controller=new AbortController();
+  state.analysisController=controller;
+  $("status").textContent=force?`RETRAINING ${symbol}…`:`UPDATING ${symbol}…`;
+  try{
+    const d=await getJSON(`/api/analyze?symbol=${encodeURIComponent(symbol)}&interval=${interval}&retrain=${force}`,controller.signal);
+    if(token!==state.viewToken||symbol!==state.symbol||interval!==state.interval)return;
+    renderAnalysis(d);
+    $("status").textContent=d.market_state.stream_connected?"● LIVE · UPSTOX STREAM":"○ LIVE · FEED RECOVERING";
+    $("status").className="status live";
+  }catch(e){
+    if(e.name!=="AbortError"){
+      if(String(e.message||"").includes("training in the background")){
+        $("status").textContent="MODEL TRAINING IN BACKGROUND… Retrying in 5s";
+        $("status").className="status closed";
+        setTimeout(()=>{if(state.marketOpen&&state.interval!=="1d")analyze(false)},5000);
+      }else{
+        $("status").textContent=`MODEL: ${e.message}`;
+        $("status").className="status error";
+      }
+    }
+  }finally{
+    if(token===state.viewToken){
+      state.busy=false;
+      $("analyze").disabled=false;
+      $("retrain").disabled=false;
+    }
+  }
+}
+async function switchTradingSymbol(next){
+  const target=(next||"SENSEX").toUpperCase()==="NIFTY 50"?"NIFTY 50":"SENSEX";
+  state.viewToken++;
+  state.busy=false;
+  state.analysisController?.abort();
+  state.liveController?.abort();
+  state.symbol=target;
+  $("symbol").value=target;
+  clearPrediction();
+  $("status").textContent=`SWITCHING TO ${target}…`;
+  $("status").className="status live";
+  await refreshLive();
+  if(state.marketOpen&&state.interval!=="1d")await analyze(false);
+}
+async function pulse(){
+  try{renderPulse(await getJSON("/api/market-pulse?limit=30"))}
+  catch(e){$("pulse-grid").innerHTML=`<div class="muted">Market pulse unavailable.</div>`}
+}
+async function newsRefresh(){
+  try{renderNews(await getJSON(`/api/news?symbol=${encodeURIComponent(state.symbol)}&name=${encodeURIComponent(state.symbol)}`))}
+  catch(e){$("news-quota").textContent=`Market news unavailable: ${e.message}`}
+}
+async function manualNewsRefresh(){
+  const b=$("news-refresh");
+  b.disabled=true;
+  b.textContent="REFRESHING…";
+  try{await getJSON("/api/news/refresh");await newsRefresh()}
+  catch(e){$("news-quota").textContent=`News refresh failed: ${e.message}`}
+  finally{b.disabled=false;b.textContent="REFRESH NEWS"}
+}
 function hideStockSuggestions(){if($("stock-suggestions"))$("stock-suggestions").innerHTML=""}
-async function loadStockSuggestions(query){if(query.length<2){hideStockSuggestions();$("stock-selection").textContent="Type at least 2 characters to see matching listed stocks.";return}state.stockSuggestController?.abort();const controller=new AbortController();state.stockSuggestController=controller;try{const d=await getJSON(`/api/stocks?q=${encodeURIComponent(query)}&limit=8`,controller.signal);if(controller.signal.aborted)return;const rows=d.results||[];$("stock-suggestions").innerHTML=rows.map(x=>`<button type="button" class="stock-suggestion" data-symbol="${esc(x.symbol)}" data-name="${esc(x.name||"")}"><b>${esc(x.symbol)}</b><span>${esc(x.name||"")}</span><small>${esc(x.exchange||"")}</small></button>`).join("")||`<div class="suggestion-empty">No matching listed stock.</div>`;$("stock-selection").textContent=rows.length?`${rows.length} matching listed stocks. Select one to forecast the next trading session.`:"No matching listed stock.";document.querySelectorAll(".stock-suggestion").forEach(btn=>btn.onclick=()=>{ $("stock-symbol").value=btn.dataset.symbol;$("stock-selection").textContent=`Selected ${btn.dataset.symbol} · ${btn.dataset.name}. Ready for next-session forecast.`;hideStockSuggestions()})}catch(e){if(e.name!=="AbortError")$("stock-selection").textContent=`Stock search unavailable: ${e.message}`}}
-async function stockForecast(){const symbol=$("stock-symbol").value.trim();const out=$("stock-result");if(!symbol){out.innerHTML=`<div class="stock-empty">Enter a listed equity symbol or choose a suggestion above.</div>`;return}$("stock-analyze").disabled=true;$("stock-analyze").textContent="CALCULATING…";out.innerHTML=`<div class="stock-loading">Loading real daily history and market-news context for ${esc(symbol)}…</div>`;try{const d=await getJSON(`/api/stock-forecast?symbol=${encodeURIComponent(symbol)}`);const pct=(Number(d.up_probability)*100).toFixed(1);const direction=d.signal;out.innerHTML=`<div class="stock-result-head"><div><span class="eyebrow">NEXT TRADING SESSION</span><h3>${esc(d.symbol)} · ${esc(d.company)}</h3><p>Expected session date: <b>${esc(d.next_session_date||"next market session")}</b></p></div><div class="pill ${direction==="UP"?"good":direction==="DOWN"?"bad":"warn"}">${esc(direction)}</div></div><div class="stock-cards"><div><span>Current price</span><b>${fmt(d.current_price)}</b></div><div><span>Expected close</span><b>${fmt(d.next_day_close)}</b></div><div><span>Expected high</span><b>${fmt(d.next_day_high)}</b></div><div><span>Expected low</span><b>${fmt(d.next_day_low)}</b></div><div><span>Chance of higher close</span><b>${pct}%</b></div><div><span>Validation accuracy</span><b>${d.validation_accuracy??"—"}%</b></div></div><div class="stock-explain"><b>How to read:</b> These are model estimates for the next trading session, not live intraday values. Training rows: ${esc(d.training_rows)} · News impact: ${Number(d.news_impact).toFixed(2)}.</div>`}catch(e){out.innerHTML=`<div class="stock-error"><b>Forecast unavailable</b><span>${esc(e.message)}</span></div>`}finally{$("stock-analyze").disabled=false;$ ("stock-analyze").textContent="PREDICT NEXT SESSION"}}
-async function loadUniverse(query=""){const b=$("universe-search-btn"),s=$("search-status");b.disabled=true;b.textContent="SEARCHING…";s.textContent=query?`Searching for “${query}”…`:"Loading listed securities…";try{const d=await getJSON(query?`/api/stocks?q=${encodeURIComponent(query)}&limit=50`:`/api/universe`);const rows=d.results||[];$("universe-badge").textContent=`DIRECTORY ${(d.total??rows.length).toLocaleString("en-IN")}`;$("universe-results").innerHTML=rows.slice(0,60).map(x=>`<button class="stock-row" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name||"")}</span><small>${esc(x.exchange||"")}</small></button>`).join("")||`<div class="muted">No securities found.</div>`;s.textContent=query?`${rows.length} result(s) found. Click one to load it.`:`Showing ${rows.length.toLocaleString("en-IN")} listed securities.`;document.querySelectorAll('.stock-row').forEach(btn=>btn.onclick=async()=>{const sym=btn.dataset.symbol;const upper=sym.toUpperCase();if(upper==="SENSEX"||upper==="NIFTY 50"){await switchTradingSymbol(upper)}else{$("stock-symbol").value=sym;$ ("stock-selection").textContent=`Selected ${sym}. Click PREDICT NEXT SESSION.`;document.querySelector('.stock-panel')?.scrollIntoView({behavior:"smooth",block:"start"})}});}catch(e){s.textContent=`Search failed: ${e.message}`}finally{b.disabled=false;b.textContent="SEARCH"}}
-async function boot(){try{const h=await getJSON('/api/health');state.predictionCadenceMs=Math.max(10000,Number(h.prediction_refresh_seconds||20)*1000);state.pollMs=Math.max(3000,Number(h.live_poll_seconds||5)*1000);state.interval=$("interval").value;await refreshLive();if(state.marketOpen&&state.interval!=="1d")await analyze(false);await newsRefresh();await pulse();await loadUniverse()}catch(e){$("status").textContent=e.message;$("status").className="status error"}}
-$("analyze").onclick=()=>analyze(false);$("retrain").onclick=()=>analyze(true);$("symbol").onchange=()=>switchTradingSymbol($("symbol").value);$("interval").onchange=async()=>{state.viewToken++;state.analysisController?.abort();state.interval=$("interval").value;clearPrediction();await refreshLive();if(state.marketOpen&&state.interval!=="1d")await analyze(false)};$("pulse").onclick=pulse;$("news-refresh").onclick=manualNewsRefresh;$("stock-analyze").onclick=stockForecast;$("stock-symbol").addEventListener("input",e=>{clearTimeout(state.stockSuggestTimer);state.stockSuggestTimer=setTimeout(()=>loadStockSuggestions(e.target.value.trim()),220)});$("stock-symbol").addEventListener("focus",()=>{if($("stock-symbol").value.trim().length>=2)loadStockSuggestions($("stock-symbol").value.trim())});document.addEventListener("click",e=>{if(!e.target.closest(".stock-search-wrap"))hideStockSuggestions()});$("universe-search-btn").onclick=()=>loadUniverse($("universe-search").value.trim());$("universe-search").onkeydown=e=>{if(e.key==='Enter')$("universe-search-btn").click()};boot();(function loop(){refreshLive().catch(()=>{}).finally(()=>setTimeout(loop,state.pollMs||5000))})();setInterval(()=>{if(state.marketOpen&&!state.busy&&Date.now()-state.lastAnalysisAt>=state.predictionCadenceMs)analyze(false)},5000);setInterval(()=>newsRefresh().catch(()=>{}),600000);setInterval(()=>pulse().catch(()=>{}),300000);
-window.addEventListener("error",e=>{const el=document.getElementById("status");if(el&&e?.error){el.textContent=`UI error recovered: ${e.error.message||e.message}`;el.className="status error";}});
+async function loadStockSuggestions(query){
+  if(query.length<2){hideStockSuggestions();$("stock-selection").textContent="Type at least 2 characters to see matching listed stocks.";return}
+  state.stockSuggestController?.abort();
+  const controller=new AbortController();
+  state.stockSuggestController=controller;
+  try{
+    const d=await getJSON(`/api/stocks?q=${encodeURIComponent(query)}&limit=8`,controller.signal);
+    if(controller.signal.aborted)return;
+    const rows=d.results||[];
+    $("stock-suggestions").innerHTML=rows.map(x=>`<button type="button" class="stock-suggestion" data-symbol="${esc(x.symbol)}" data-name="${esc(x.name||"")}"><b>${esc(x.symbol)}</b><span>${esc(x.name||"")}</span><small>${esc(x.exchange||"")}</small></button>`).join("")||`<div class="suggestion-empty">No matching listed stock.</div>`;
+    $("stock-selection").textContent=rows.length?`${rows.length} matching listed stocks. Select one to forecast the next trading session.`:"No matching listed stock.";
+    document.querySelectorAll(".stock-suggestion").forEach(btn=>btn.onclick=()=>{
+      $("stock-symbol").value=btn.dataset.symbol;
+      $("stock-selection").textContent=`Selected ${btn.dataset.symbol} · ${btn.dataset.name}. Ready for next-session forecast.`;
+      hideStockSuggestions();
+    });
+  }catch(e){
+    if(e.name!=="AbortError")$("stock-selection").textContent=`Stock search unavailable: ${e.message}`;
+  }
+}
+async function stockForecast(){
+  const symbol=$("stock-symbol").value.trim();
+  const out=$("stock-result");
+  if(!symbol){out.innerHTML=`<div class="stock-empty">Enter a listed equity symbol or choose a suggestion above.</div>`;return}
+  $("stock-analyze").disabled=true;
+  $("stock-analyze").textContent="CALCULATING…";
+  out.innerHTML=`<div class="stock-loading">Loading real daily history and market-news context for ${esc(symbol)}…</div>`;
+  try{
+    const d=await getJSON(`/api/stock-forecast?symbol=${encodeURIComponent(symbol)}`);
+    const pct=(Number(d.up_probability)*100).toFixed(1);
+    const direction=d.signal;
+    out.innerHTML=`<div class="stock-result-head"><div><span class="eyebrow">NEXT TRADING SESSION</span><h3>${esc(d.symbol)} · ${esc(d.company)}</h3><p>Expected session date: <b>${esc(d.next_session_date||"next market session")}</b></p></div><div class="pill ${direction==="UP"?"good":direction==="DOWN"?"bad":"warn"}">${esc(direction)}</div></div><div class="stock-cards"><div><span>Current price</span><b>${fmt(d.current_price)}</b></div><div><span>Expected close</span><b>${fmt(d.next_day_close)}</b></div><div><span>Expected high</span><b>${fmt(d.next_day_high)}</b></div><div><span>Expected low</span><b>${fmt(d.next_day_low)}</b></div><div><span>Chance of higher close</span><b>${pct}%</b></div><div><span>Validation accuracy</span><b>${d.validation_accuracy??"—"}%</b></div></div><div class="stock-explain"><b>How to read:</b> These are model estimates for the next trading session, not live intraday values. Training rows: ${esc(d.training_rows)} · News impact: ${Number(d.news_impact).toFixed(2)}.</div>`;
+  }catch(e){
+    out.innerHTML=`<div class="stock-error"><b>Forecast unavailable</b><span>${esc(e.message)}</span></div>`;
+  }finally{
+    $("stock-analyze").disabled=false;
+    $("stock-analyze").textContent="PREDICT NEXT SESSION";
+  }
+}
+async function loadUniverse(query=""){
+  const b=$("universe-search-btn"),s=$("search-status");
+  b.disabled=true;
+  b.textContent="SEARCHING…";
+  s.textContent=query?`Searching for “${query}”…`:"Loading listed securities…";
+  try{
+    const d=await getJSON(query?`/api/stocks?q=${encodeURIComponent(query)}&limit=50`:`/api/universe`);
+    const rows=d.results||[];
+    $("universe-badge").textContent=`DIRECTORY ${(d.total??rows.length).toLocaleString("en-IN")}`;
+    $("universe-results").innerHTML=rows.slice(0,60).map(x=>`<button class="stock-row" data-symbol="${esc(x.symbol)}"><b>${esc(x.symbol)}</b><span>${esc(x.name||"")}</span><small>${esc(x.exchange||"")}</small></button>`).join("")||`<div class="muted">No securities found.</div>`;
+    s.textContent=query?`${rows.length} result(s) found. Click one to load it.`:`Showing ${rows.length.toLocaleString("en-IN")} listed securities.`;
+    document.querySelectorAll('.stock-row').forEach(btn=>btn.onclick=async()=>{
+      const sym=btn.dataset.symbol;
+      const upper=sym.toUpperCase();
+      if(upper==="SENSEX"||upper==="NIFTY 50"){
+        await switchTradingSymbol(upper);
+      }else{
+        $("stock-symbol").value=sym;
+        $("stock-selection").textContent=`Selected ${sym}. Click PREDICT NEXT SESSION.`;
+        document.querySelector('.stock-panel')?.scrollIntoView({behavior:"smooth",block:"start"});
+      }
+    });
+  }catch(e){
+    s.textContent=`Search failed: ${e.message}`;
+  }finally{
+    b.disabled=false;
+    b.textContent="SEARCH";
+  }
+}
+function checkAuthParams(){
+  const params=new URLSearchParams(window.location.search);
+  const banner=$("alert-banner");
+  if(params.get("connected")==="1"){
+    state.authBannerActive=true;
+    if(banner){
+      banner.style.display="flex";
+      banner.className="alert-banner success";
+      banner.innerHTML=`<span>✅ Upstox connected successfully! Live market streaming is active.</span><button class="banner-btn" onclick="state.authBannerActive=false;this.parentElement.style.display='none'">Dismiss</button>`;
+    }
+    window.history.replaceState({},document.title,window.location.pathname);
+  }else if(params.get("auth_error")){
+    state.authBannerActive=true;
+    if(banner){
+      banner.style.display="flex";
+      banner.className="alert-banner error";
+      banner.innerHTML=`<span>⚠️ Upstox authorization failed: ${esc(params.get("auth_error"))}</span><a href="/auth/upstox/start" class="banner-btn">Try Again</a>`;
+    }
+    window.history.replaceState({},document.title,window.location.pathname);
+  }
+}
+async function boot(){
+  checkAuthParams();
+  try{
+    const h=await getJSON('/api/health');
+    state.predictionCadenceMs=Math.max(10000,Number(h.prediction_refresh_seconds||20)*1000);
+    state.pollMs=Math.max(3000,Number(h.live_poll_seconds||5)*1000);
+    const chip=$("upstox-chip");
+    if(chip){
+      if(h.upstox_connected){
+        chip.className="status-chip good";
+        chip.textContent="● Upstox: Connected";
+        chip.href="#";
+      }else{
+        chip.className="status-chip bad";
+        chip.textContent="○ Connect Upstox";
+        chip.href="/auth/upstox/start";
+      }
+    }
+    state.interval=$("interval").value;
+    await refreshLive();
+    if(state.marketOpen&&state.interval!=="1d")await analyze(false);
+    await newsRefresh();
+    await pulse();
+    await loadUniverse();
+  }catch(e){
+    $("status").textContent=e.message;
+    $("status").className="status error";
+  }
+}
+
+document.addEventListener("visibilitychange",()=>{
+  state.isTabVisible=!document.hidden;
+  if(state.isTabVisible){
+    refreshLive().catch(()=>{});
+    if(state.marketOpen&&state.interval!=="1d")analyze(false);
+  }
+});
+
+$("analyze").onclick=()=>analyze(false);
+$("retrain").onclick=()=>analyze(true);
+$("symbol").onchange=()=>switchTradingSymbol($("symbol").value);
+$("interval").onchange=async()=>{
+  state.viewToken++;
+  state.analysisController?.abort();
+  state.interval=$("interval").value;
+  clearPrediction();
+  await refreshLive();
+  if(state.marketOpen&&state.interval!=="1d")await analyze(false);
+};
+$("pulse").onclick=pulse;
+$("news-refresh").onclick=manualNewsRefresh;
+$("stock-analyze").onclick=stockForecast;
+$("stock-symbol").addEventListener("input",e=>{
+  clearTimeout(state.stockSuggestTimer);
+  state.stockSuggestTimer=setTimeout(()=>loadStockSuggestions(e.target.value.trim()),220);
+});
+$("stock-symbol").addEventListener("focus",()=>{
+  if($("stock-symbol").value.trim().length>=2)loadStockSuggestions($("stock-symbol").value.trim());
+});
+document.addEventListener("click",e=>{
+  if(!e.target.closest(".stock-search-wrap"))hideStockSuggestions();
+});
+$("universe-search-btn").onclick=()=>loadUniverse($("universe-search").value.trim());
+$("universe-search").onkeydown=e=>{if(e.key==='Enter')$("universe-search-btn").click()};
+
+boot();
+
+(function loop(){
+  if(state.isTabVisible){
+    refreshLive().catch(()=>{}).finally(()=>setTimeout(loop,state.pollMs||5000));
+  }else{
+    setTimeout(loop,5000);
+  }
+})();
+
+setInterval(()=>{
+  if(state.isTabVisible&&state.marketOpen&&!state.busy&&Date.now()-state.lastAnalysisAt>=state.predictionCadenceMs){
+    analyze(false);
+  }
+},5000);
+
+setInterval(()=>{if(state.isTabVisible)newsRefresh().catch(()=>{})},600000);
+setInterval(()=>{if(state.isTabVisible)pulse().catch(()=>{})},300000);
+
+window.addEventListener("error",e=>{
+  const el=document.getElementById("status");
+  if(el&&e?.error){
+    el.textContent=`UI error recovered: ${e.error.message||e.message}`;
+    el.className="status error";
+  }
+});

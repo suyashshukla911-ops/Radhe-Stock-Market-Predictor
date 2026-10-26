@@ -13,6 +13,30 @@ IST = "Asia/Kolkata"
 MARKET_OPEN_MINUTES = 9 * 60 + 15
 MARKET_CLOSE_MINUTES = 15 * 60 + 30
 
+def _resolve_cache_dir() -> Path:
+    candidates = [
+        os.getenv("CACHE_DIR"),
+        os.getenv("DATA_DIR"),
+        str(ROOT_DIR / "data_cache"),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            p = Path(c).resolve()
+            p.mkdir(parents=True, exist_ok=True)
+            test_file = p / ".write_test"
+            test_file.touch(exist_ok=True)
+            test_file.unlink(missing_ok=True)
+            return p
+        except (OSError, PermissionError):
+            continue
+    fallback = ROOT_DIR / "data_cache"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+CACHE_DIR = _resolve_cache_dir()
+
 # NSE cash-market weekday holidays, 2026 (verify yearly against the NSE circular).
 NSE_HOLIDAYS_SET = {
     "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03",
