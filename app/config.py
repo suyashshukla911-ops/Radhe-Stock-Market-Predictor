@@ -13,7 +13,7 @@ IST = "Asia/Kolkata"
 MARKET_OPEN_MINUTES = 9 * 60 + 15
 MARKET_CLOSE_MINUTES = 15 * 60 + 30
 
-def _resolve_cache_dir() -> Path:
+def get_cache_dir() -> Path:
     candidates = [
         os.getenv("CACHE_DIR"),
         os.getenv("DATA_DIR"),
@@ -32,10 +32,14 @@ def _resolve_cache_dir() -> Path:
         except (OSError, PermissionError):
             continue
     fallback = ROOT_DIR / "data_cache"
-    fallback.mkdir(parents=True, exist_ok=True)
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     return fallback
 
-CACHE_DIR = _resolve_cache_dir()
+_resolve_cache_dir = get_cache_dir
+CACHE_DIR = get_cache_dir()
 
 # NSE cash-market weekday holidays, 2026 (verify yearly against the NSE circular).
 NSE_HOLIDAYS_SET = {
@@ -112,12 +116,14 @@ class Settings:
     chart_bars: int
     history_cache_minutes: int
     live_rest_cache_seconds: int
+    admin_key: str
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
             app_name=os.getenv("APP_NAME", "Suyash Stock Market Predictor"),
             base_url=os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/"),
+            admin_key=os.getenv("ADMIN_KEY", "").strip(),
             upstox_access_token=os.getenv("UPSTOX_ACCESS_TOKEN", "").strip(),
             upstox_client_id=os.getenv("UPSTOX_CLIENT_ID", "").strip(),
             upstox_client_secret=os.getenv("UPSTOX_CLIENT_SECRET", "").strip(),

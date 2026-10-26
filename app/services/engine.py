@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from app.config import CACHE_DIR, IST, SECTOR_BY_SYMBOL, settings
+from app.config import CACHE_DIR, IST, SECTOR_BY_SYMBOL, get_cache_dir, settings
 from app.data.news import NewsService
 from app.data.upstox import Instrument, LiveMarketHub, UpstoxAuthError, UpstoxClient, UpstoxError
 from app.ml.features import FEATURES, build_features, prepare_training_frame
@@ -42,12 +42,12 @@ class AnalysisEngine:
         self._morning_cache = {}
         self.eod_locked = {}
         self._analysis_lock = threading.RLock()
-        cache_dir = Path(os.getenv("CACHE_DIR") or os.getenv("DATA_DIR") or CACHE_DIR)
+        self.cache_dir = get_cache_dir()
         try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        self._session_state_file = cache_dir / 'eod_outlook.json'
+        self._session_state_file = self.cache_dir / 'eod_outlook.json'
         self._load_session_state()
 
     def eod_locked_status(self) -> dict:
@@ -78,6 +78,87 @@ class AnalysisEngine:
         except Exception:
             pass
     _save_state = _save_session_state
+
+    def _save_model_to_disk(self, instrument: Instrument, interval: int, cache: ModelCache):
+        try:
+            import pickle
+            mdir = self.cache_dir / "models"
+            mdir.mkdir(parents=True, exist_ok=True)
+            path = mdir / f"{instrument.trading_symbol}_{interval}m.pkl"
+            with open(path, "wb") as f:
+                pickle.dump({"model": cache.model, "fitted_at": cache.fitted_at}, f)
+        except Exception:
+            pass
+
+    def _load_saved_model(self, instrument: Instrument, interval: int) -> ModelCache | None:
+        try:
+            import pickle
+            path = self.cache_dir / "models" / f"{instrument.trading_symbol}_{interval}m.pkl"
+            if not path.exists():
+                return None
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            fitted_at = float(data.get("fitted_at", 0))
+            if time.time() - fitted_at < settings.model_retrain_minutes * 60:
+                mc = ModelCache(data["model"], fitted_at, pd.DataFrame(), {})
+                self.models[(instrument.instrument_key, int(interval))] = mc
+                return mc
+        except Exception:
+            pass
+        return None
+
+    def _journal_prediction(self, instrument: Instrument, interval: int, current_price: float, pred: dict, path: list):
+        try:
+            import sqlite3
+            db_path = self.cache_dir / "predictions_journal.db"
+            with sqlite3.connect(str(db_path), timeout=5) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS predictions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT,
+                        symbol TEXT,
+                        interval INTEGER,
+                        current_price REAL,
+                        predicted_close REAL,
+                        predicted_high REAL,
+                        predicted_low REAL,
+                        probability_up REAL,
+                        signal TEXT
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO predictions (
+                        created_at, symbol, interval, current_price,
+                        predicted_close, predicted_high, predicted_low,
+                        probability_up, signal
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    datetime.now(ZoneInfo(IST)).isoformat(),
+                    instrument.trading_symbol,
+                    int(interval),
+                    float(current_price),
+                    float(pred.get("predicted_close", 0.0)),
+                    float(pred.get("predicted_high", 0.0)),
+                    float(pred.get("predicted_low", 0.0)),
+                    float(pred.get("probability_up", 0.5)),
+                    str(pred.get("signal", "REVALIDATE"))
+                ))
+        except Exception:
+            pass
+
+    def get_journal(self, limit: int = 50) -> list[dict]:
+        try:
+            import sqlite3
+            db_path = self.cache_dir / "predictions_journal.db"
+            if not db_path.exists():
+                return []
+            with sqlite3.connect(str(db_path), timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM predictions ORDER BY id DESC LIMIT ?", (limit,))
+                return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            return []
 
     @staticmethod
     def _market_open():
@@ -146,6 +227,7 @@ class AnalysisEngine:
         model.fit(train, FEATURES)
         cache = ModelCache(model, time.time(), history_train, context_train)
         self.models[key] = cache
+        self._save_model_to_disk(instrument, int(interval), cache)
         return cache
 
     def _retrain_async(self, instrument, interval):
@@ -172,6 +254,10 @@ class AnalysisEngine:
         fresh = bool(cached) and time.time() - cached.fitted_at < settings.model_retrain_minutes * 60
         if cached and fresh and not force:
             return cached
+        if not cached and not force:
+            saved = self._load_saved_model(instrument, int(interval))
+            if saved:
+                return saved
         self._retrain_async(instrument, interval)
         if cached:
             return cached
@@ -348,6 +434,7 @@ class AnalysisEngine:
                 '_created_at': time.time()
             }
             self.last_results[key] = result
+            self._journal_prediction(instrument, int(interval), current_price, live_pred, path)
             return {k: v for k, v in result.items() if k != '_created_at'}
 
     def daily_view(self, instrument: Instrument):
@@ -421,7 +508,13 @@ class AnalysisEngine:
         if tick is None and not bars.empty:
             last = bars.iloc[-1]
             ts = pd.Timestamp(last.timestamp).tz_convert(IST)
-            tick = {'price': float(last.close), 'trade_time': ts.isoformat(), 'updated_at': ts.isoformat(), 'instrument_key': instrument.instrument_key, 'session_trade': False}
+            tick = {
+                'price': float(last.close),
+                'trade_time': ts.isoformat(),
+                'updated_at': now.isoformat() if open_now else ts.isoformat(),
+                'instrument_key': instrument.instrument_key,
+                'session_trade': False
+            }
         current = None
         secs = 0
         if not bars.empty:
@@ -432,8 +525,27 @@ class AnalysisEngine:
             current = {'start': start.isoformat(), 'end': end.isoformat(), 'open': float(row.open), 'high': float(row.high), 'low': float(row.low), 'close': float(row.close), 'volume': float(row.volume or 0), 'forming': forming}
             if forming:
                 secs = max(0, int((end.to_pydatetime() - now).total_seconds()))
+
+        # Determine feed age strictly from the live trade tick or raw 1m feed, NEVER from aggregated 5m..60m bars
         age = None
-        if tick and tick.get('updated_at'):
+        real_tick = self.live.latest(instrument.instrument_key)
+        if real_tick and real_tick.get('updated_at'):
+            try:
+                age = round(max(0, (now - datetime.fromisoformat(real_tick['updated_at'])).total_seconds()), 1)
+            except Exception:
+                pass
+        elif instrument.instrument_key in self._rest_live_cache:
+            cache_ts, df_1m = self._rest_live_cache[instrument.instrument_key]
+            if not df_1m.empty:
+                last_1m = pd.Timestamp(df_1m.iloc[-1].timestamp).tz_convert(IST)
+                bar_end = last_1m + pd.to_timedelta(1, unit="m")
+                if now < bar_end:
+                    age = round(max(0, time.time() - cache_ts), 1)
+                else:
+                    age = round(max(0, (now - bar_end).total_seconds()), 1)
+            else:
+                age = round(max(0, time.time() - cache_ts), 1)
+        elif tick and tick.get('updated_at') and not open_now:
             try:
                 age = round(max(0, (now - datetime.fromisoformat(tick['updated_at'])).total_seconds()), 1)
             except Exception:
@@ -445,9 +557,6 @@ class AnalysisEngine:
         elif self.upstox.last_auth_error:
             data_status = "TOKEN_EXPIRED"
             data_msg = "Upstox session expired (401/403). Please re-login."
-        elif self.live.last_error and any(x in self.live.last_error.lower() for x in ("401", "403", "unauthorized", "token", "expired")):
-            data_status = "TOKEN_EXPIRED"
-            data_msg = "Upstox session expired. Please re-login."
         elif open_now and not self.live.connected and bars.empty:
             data_status = "FEED_DOWN"
             data_msg = "Live feed recovering. Waiting for market data."

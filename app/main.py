@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import CACHE_DIR, IST, NSE_HOLIDAYS_LIST, PRIORITY_STOCKS, settings
+from app.config import CACHE_DIR, IST, NSE_HOLIDAYS_LIST, PRIORITY_STOCKS, get_cache_dir, settings
 from app.data.news import NewsService
 from app.data.upstox import LiveMarketHub, UpstoxAuthError, UpstoxClient, UpstoxError
 from app.services.engine import AnalysisEngine
@@ -28,12 +28,16 @@ logger = logging.getLogger("suyash.app")
 BASE_DIR = Path(__file__).resolve().parents[1]
 FRONTEND_DIR = BASE_DIR / "frontend"
 
-TOKEN_FILE = CACHE_DIR / "upstox_token.json"
+def _token_file() -> Path:
+    return get_cache_dir() / "upstox_token.json"
 
 def _load_saved_token():
     """Re-use today's OAuth token after a restart (Upstox tokens expire ~03:30 IST next day)."""
     try:
-        obj = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        tfile = _token_file()
+        if not tfile.exists():
+            return ""
+        obj = json.loads(tfile.read_text(encoding="utf-8"))
         issued = datetime.fromisoformat(obj["issued_at"])
         now = datetime.now(ZoneInfo(IST))
         expiry = issued.replace(hour=3, minute=30, second=0, microsecond=0)
@@ -43,9 +47,9 @@ def _load_saved_token():
     except Exception:
         return ""
 
-upstox = UpstoxClient(_load_saved_token() or settings.upstox_access_token, cache_dir=CACHE_DIR)
+upstox = UpstoxClient(_load_saved_token() or settings.upstox_access_token, cache_dir=get_cache_dir())
 live = LiveMarketHub(upstox)
-news = NewsService(settings.news_api_key, max_records=20, state_dir=CACHE_DIR)
+news = NewsService(settings.news_api_key, max_records=20, state_dir=get_cache_dir())
 engine = AnalysisEngine(upstox, live, news)
 stock_forecaster = StockForecastService(upstox, news)
 oauth_states: dict[str, float] = {}
@@ -70,14 +74,65 @@ def _eod_locker():
             logger.warning("EOD locker loop error: %s", exc)
         time.sleep(30)
 
+def _token_validator_and_warmup():
+    """Periodic background token validation (every 60s), morning alert (08:50 IST), and pre-open warmup (09:00 IST)."""
+    last_val_time = 0.0
+    last_alert_day = ""
+    last_warmup_day = ""
+    while True:
+        try:
+            now = datetime.now(ZoneInfo(IST))
+            today_str = now.strftime("%Y-%m-%d")
+            minute = now.hour * 60 + now.minute
+
+            if upstox.connected and time.time() - last_val_time >= 60:
+                last_val_time = time.time()
+                try:
+                    upstox.validate_token(allow_network=True)
+                except Exception:
+                    pass
+
+            if now.weekday() < 5 and 8 * 60 + 50 <= minute < 9 * 60 and last_alert_day != today_str:
+                last_alert_day = today_str
+                is_valid = upstox.validate_token(allow_network=True) if upstox.connected else False
+                if not is_valid:
+                    logger.warning("MORNING TOKEN ALERT: Upstox session token missing or expired before 09:15 open! Please authenticate via /auth/upstox/start")
+
+            if now.weekday() < 5 and 9 * 60 <= minute < 9 * 60 + 15 and last_warmup_day != today_str:
+                last_warmup_day = today_str
+                try:
+                    logger.info("PRE-OPEN WARMUP: Loading instrument master and pre-subscribing key indices...")
+                    upstox.load_instruments()
+                    keys = []
+                    for sym in ("SENSEX", "NIFTY 50", "NIFTY BANK", "INDIA VIX"):
+                        try:
+                            keys.append(upstox.resolve_symbol(sym).instrument_key)
+                        except Exception:
+                            pass
+                    if keys:
+                        live.subscribe(keys)
+                except Exception as exc:
+                    logger.warning("PRE-OPEN WARMUP failed: %s", exc)
+
+        except Exception as exc:
+            logger.warning("Background validator/warmup loop error: %s", exc)
+        time.sleep(30)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     live.start()
     news.start()
     threading.Thread(target=_eod_locker, name="eod-locker", daemon=True).start()
+    threading.Thread(target=_token_validator_and_warmup, name="token-validator", daemon=True).start()
     yield
 
 app = FastAPI(title=settings.app_name, version="3.0.0", lifespan=lifespan)
+
+def _require_admin(request: Request):
+    if settings.admin_key:
+        auth_header = request.headers.get("X-Admin-Key") or request.query_params.get("admin_key")
+        if auth_header != settings.admin_key:
+            raise HTTPException(403, "Admin authorization required.")
 
 @app.middleware("http")
 async def add_security_and_cache_headers(request: Request, call_next):
@@ -106,9 +161,10 @@ def health():
     token_issued = None
     token_expiry = None
     is_expired = False
-    if TOKEN_FILE.exists():
+    tfile = _token_file()
+    if tfile.exists():
         try:
-            info = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+            info = json.loads(tfile.read_text(encoding="utf-8"))
             issued = datetime.fromisoformat(info["issued_at"])
             token_issued = issued.isoformat()
             now = datetime.now(ZoneInfo(IST))
@@ -122,7 +178,8 @@ def health():
         except Exception:
             pass
 
-    token_valid = bool(upstox.connected and not is_expired and not upstox.last_auth_error and upstox.validate_token())
+    # Instant check: allow_network=False avoids blocking Render health checks
+    token_valid = bool(upstox.connected and not is_expired and not upstox.last_auth_error and upstox.validate_token(allow_network=False))
     models_ready = [f"{k[0]}:{k[1]}m" for k in engine.models.keys()]
 
     return {
@@ -139,7 +196,7 @@ def health():
         "stream_connected": live.connected,
         "stream_error": live.last_error,
         "models_ready": models_ready,
-        "cache_dir": str(CACHE_DIR),
+        "cache_dir": str(get_cache_dir()),
         "news": news.diagnostics(),
         "live_poll_seconds": settings.live_poll_seconds,
         "prediction_refresh_seconds": settings.prediction_refresh_seconds,
@@ -227,7 +284,8 @@ def news_download():
         raise HTTPException(503, str(exc))
 
 @app.get("/api/news/refresh")
-def news_refresh():
+def news_refresh(request: Request):
+    _require_admin(request)
     try:
         result = news.refresh_toi()
         return {"ok": True, **result}
@@ -239,7 +297,9 @@ def news_quota():
     return news.diagnostics()
 
 @app.get("/api/analyze")
-def analyze(symbol: str = Query(..., min_length=1, max_length=100), interval: str = Query("5"), retrain: bool = False):
+def analyze(request: Request, symbol: str = Query(..., min_length=1, max_length=100), interval: str = Query("5"), retrain: bool = False):
+    if retrain:
+        _require_admin(request)
     if interval not in {"1", "5", "10", "15", "30", "60"}:
         raise HTTPException(422, "Prediction timeframes: 1m, 5m, 10m, 15m, 30m and 60m. Use 1D for previous-session history.")
     try:
@@ -312,7 +372,7 @@ def live_state(symbol: str = Query(..., min_length=1, max_length=100), interval:
         if not upstox.access_token:
             data_status = "NO_TOKEN"
             data_msg = "Upstox access token missing. Please connect Upstox."
-        elif upstox.last_auth_error or any(x in err_str.lower() for x in ("401", "403", "unauthorized", "token", "expired")):
+        elif upstox.last_auth_error:
             data_status = "TOKEN_EXPIRED"
             data_msg = "Upstox session expired (401/403). Please re-login."
         elif clock["is_open"]:
@@ -381,7 +441,7 @@ def upstox_callback(code: Optional[str] = None, state: Optional[str] = None, err
             raise ValueError("No access token returned by Upstox.")
         upstox.set_access_token(token)
         try:
-            TOKEN_FILE.write_text(json.dumps({"access_token": token, "issued_at": datetime.now(ZoneInfo(IST)).isoformat()}), encoding="utf-8")
+            _token_file().write_text(json.dumps({"access_token": token, "issued_at": datetime.now(ZoneInfo(IST)).isoformat()}), encoding="utf-8")
         except Exception:
             pass
         live.restart(token)
@@ -389,6 +449,30 @@ def upstox_callback(code: Optional[str] = None, state: Optional[str] = None, err
     except Exception as exc:
         logger.exception("Upstox OAuth exchange failed: %s", exc)
         return RedirectResponse(f"/?auth_error={quote(str(exc))}")
+
+@app.get("/api/status")
+def status_endpoint():
+    val_status = upstox.validate_token(allow_network=True) if upstox.connected else False
+    return {
+        "ok": True,
+        "app_name": settings.app_name,
+        "upstox_connected": upstox.connected,
+        "token_valid": val_status,
+        "last_auth_error": upstox.last_auth_error,
+        "last_ok_at": upstox.last_ok_at,
+        "stream_connected": live.connected,
+        "stream_last_error": live.last_error,
+        "reconnect_attempts": getattr(live, "reconnect_attempts", 0),
+        "eod_locked": engine.eod_locked_status(),
+        "cached_models": [f"{k[0]}:{k[1]}m" for k in engine.models.keys()],
+        "news_diagnostics": news.diagnostics(),
+        "cache_dir": str(get_cache_dir()),
+    }
+
+@app.get("/api/journal")
+def journal_endpoint(limit: int = Query(50, ge=1, le=200)):
+    items = engine.get_journal(limit)
+    return {"count": len(items), "predictions": items}
 
 @app.get("/api/config")
 def config():

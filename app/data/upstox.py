@@ -18,7 +18,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from app.config import CACHE_DIR, INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES, NSE_HOLIDAYS_SET
+from app.config import CACHE_DIR, INDEX_INSTRUMENTS, IST, MARKET_CLOSE_MINUTES, MARKET_OPEN_MINUTES, NSE_HOLIDAYS_SET, get_cache_dir
 
 try:
     import upstox_client
@@ -64,8 +64,11 @@ class UpstoxClient:
         adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retry)
         self.session.mount("https://", adapter)
         self.session.headers.update({"Accept": "application/json", "User-Agent": "SuyashStockMarketPredictor/3.0"})
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else CACHE_DIR
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else get_cache_dir()
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         self._instruments: list[Instrument] | None = None
         self._lock = threading.RLock()
         self._rest_cache: dict[str, tuple[float, object]] = {}
@@ -79,10 +82,20 @@ class UpstoxClient:
         self.last_auth_error = ""
         self._token_val_cache = (0.0, False)
 
-    def validate_token(self) -> bool:
+    def validate_token(self, allow_network: bool = False) -> bool:
         if not self.access_token:
             return False
+        if self.last_auth_error:
+            return False
         now = time.time()
+        # If network calls are not permitted (e.g. inside fast health checks), use cached status
+        if not allow_network:
+            if self._token_val_cache[0] > 0:
+                return self._token_val_cache[1]
+            if self.last_ok_at is not None:
+                return (now - self.last_ok_at) < 86400
+            return bool(self.access_token)
+
         if now - self._token_val_cache[0] < 60:
             return self._token_val_cache[1]
         try:
@@ -399,9 +412,18 @@ class UpstoxClient:
         from_date = to_date - timedelta(days=calendar_days)
         if interval == "1d":
             return self.get_daily_history(instrument_key, calendar_days)
-        if int(interval) != 1:
+        iv = int(interval)
+        if iv in (30, 60):
+            # Upstox V3 supports native 30m and 60m minute intervals directly (92-day chunks)
+            try:
+                native = self.get_historical(instrument_key, iv, from_date, to_date)
+                if not native.empty:
+                    return native
+            except Exception:
+                pass
+        if iv != 1:
             base = self.get_historical(instrument_key, 1, from_date, to_date)
-            return self.aggregate_minutes(base, int(interval))
+            return self.aggregate_minutes(base, iv)
         return self.get_historical(instrument_key, 1, from_date, to_date)
 
     def get_quote_batch(self, instrument_keys: Iterable[str]) -> dict:
